@@ -1,0 +1,20 @@
+[package]
+name = "pqeditor"
+version = "0.1.0"
+edition = "2024"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[dependencies]
+anyhow = "1.0.104"
+csv = "1.4.0"
+duckdb = { version = "1.20000.1", features = ["bundled"] }
+eframe = { version = "0.37.0", features = ["persistence"] }
+egui = "0.37.0"
+egui_extras = "0.37.0"
+rfd = "0.18.0"
+rust_xlsxwriter = "0.102.0"
+serde = { version = "1.0.229", features = ["derive"] }

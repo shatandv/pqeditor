@@ -1,0 +1,10 @@
+# This machine has 12 GB RAM; the bundled DuckDB build spawns huge C++
+# translation units that freeze the box at 16-way parallelism.
+# These settings make plain `cargo build` safe everywhere the repo goes;
+# remove or raise on a machine with more memory.
+[build]
+jobs = 2
+
+[env]
+NUM_JOBS = "2"
+CMAKE_BUILD_PARALLEL_LEVEL = "2"

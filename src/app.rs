@@ -1,0 +1,577 @@
+//! Application state: windows, files, selection, edits, dialogs.
+
+use std::collections::HashSet;
+use std::path::PathBuf;
+
+use serde::{Deserialize, Serialize};
+
+use crate::data::engine::{Engine, FailSource, Job, JobKind, JobResult};
+pub use crate::data::engine::ExportFormat;
+use crate::data::model::{GridState, PAGE_SIZE};
+use crate::data::types::{ColumnSchema, ColumnStats, EditValue, SortKey};
+
+/// Where per-file state lives. One file open at a time (v1).
+pub struct FileState {
+    pub path: PathBuf,
+    pub grid: GridState,
+    /// Rows matching the current filter; 0 while the count is in flight.
+    pub shown_rows: u64,
+    /// Total rows in the file, independent of the filter.
+    pub total_rows: u64,
+    pub count_pending: bool,
+    pub selection: Option<Sel>,
+    pub editing: Option<EditState>,
+    /// Text currently in the filter box (draft; the applied filter lives in
+    /// `grid.filter`).
+    pub filter_draft: String,
+    pub filter_error: Option<String>,
+    /// Filter candidate awaiting validation by the engine.
+    pub pending_filter: Option<String>,
+    pub stats: Vec<ColumnStats>,
+    pub popover: Option<FilterPopover>,
+    pub export_dialog: Option<ExportDialog>,
+    /// Go-to-row dialog state: `None` = closed, `Some(draft)` = open.
+    pub goto_row: Option<String>,
+    /// Row to scroll to on the next grid draw (keyboard navigation).
+    pub scroll_to_row: Option<u64>,
+    /// Cell edit validation error, surfaced in the status bar.
+    pub commit_error: Option<String>,
+}
+
+impl FileState {
+    pub fn new(path: PathBuf, schema: Vec<ColumnSchema>, total_rows: u64) -> Self {
+        Self {
+            path,
+            grid: GridState::new(schema),
+            shown_rows: total_rows,
+            total_rows,
+            count_pending: false,
+            selection: None,
+            editing: None,
+            filter_draft: String::new(),
+            filter_error: None,
+            pending_filter: None,
+            stats: Vec::new(),
+            popover: None,
+            export_dialog: None,
+            goto_row: None,
+            scroll_to_row: None,
+            commit_error: None,
+        }
+    }
+
+    /// Adjust the sort stack: plain click replaces, shift+click appends.
+    /// asc -> desc -> off on the same column.
+    pub fn cycle_sort(&mut self, col: usize, append: bool) {
+        let mut sort = if append { self.grid.sort.clone() } else { Vec::new() };
+        match sort.iter().position(|k| k.col == col) {
+            Some(i) => {
+                if sort[i].ascending {
+                    sort[i].ascending = false;
+                } else {
+                    sort.remove(i);
+                }
+            }
+            None => sort.push(SortKey { col, ascending: true }),
+        }
+        let filter = self.grid.filter.clone();
+        self.grid.requery(sort, filter);
+        self.selection = None;
+    }
+
+    /// Start editing a cell (type permitting).
+    pub fn begin_edit_at(&mut self, rowid: u64, col: usize) {
+        let Some(schema) = self.grid.schema.get(col) else { return };
+        if !schema.ty.editable() {
+            self.commit_error = Some(format!(
+                "column '{}' ({}) is read-only",
+                schema.name,
+                schema.ty.label()
+            ));
+            return;
+        }
+        let text = self.grid.edit_source_text(rowid, col).unwrap_or_default();
+        self.editing = Some(EditState { rowid, col, text });
+    }
+
+    /// Commit the active edit: validate against the column type, store in
+    /// the overlay. On validation failure the editor stays open and the
+    /// error is recorded.
+    pub fn commit_editing(&mut self) {
+        self.commit_error = None;
+        let Some(edit) = self.editing.clone() else { return };
+        let Some(schema) = self.grid.schema.get(edit.col) else {
+            self.editing = None;
+            return;
+        };
+        match crate::data::types::validate_edit(schema.ty, &edit.text) {
+            Ok(val) => {
+                self.grid.overlay.set(edit.rowid, edit.col, val);
+                self.editing = None;
+            }
+            Err(msg) => self.commit_error = Some(msg),
+        }
+    }
+
+    /// Apply the pending filter (engine already validated it).
+    pub fn apply_filter(&mut self, filter: Option<String>) {
+        self.filter_draft = filter.clone().unwrap_or_default();
+        self.filter_error = None;
+        self.pending_filter = None;
+        let sort = self.grid.sort.clone();
+        self.grid.requery(sort, filter);
+    }
+
+    /// New sort stack / manual requery after external changes (save).
+    pub fn requery(&mut self) {
+        let sort = self.grid.sort.clone();
+        let filter = self.grid.filter.clone();
+        self.grid.requery(sort, filter);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Sel {
+    pub rowid: u64,
+    pub col: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct EditState {
+    pub rowid: u64,
+    pub col: usize,
+    pub text: String,
+}
+
+/// The per-column filter popover.
+pub struct FilterPopover {
+    pub col: usize,
+    pub search: String,
+    pub values: Vec<(String, u64)>,
+    pub truncated: bool,
+    /// Requested but not answered yet.
+    pub loading: bool,
+    /// Checked value display-strings (including the null sentinel).
+    pub checked: HashSet<String>,
+}
+
+pub const NULL_SENTINEL: &str = "· null";
+
+impl FilterPopover {
+    pub fn new(col: usize) -> Self {
+        Self {
+            col,
+            search: String::new(),
+            values: Vec::new(),
+            truncated: false,
+            loading: true,
+            checked: HashSet::new(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ExportScope {
+    Filtered,
+    All,
+}
+
+#[derive(Clone)]
+pub struct ExportDialog {
+    pub scope: ExportScope,
+    pub format: ExportFormat,
+    pub delimiter: char,
+    pub path: String,
+}
+
+pub struct App {
+    pub engine: Engine,
+    pub file: Option<FileState>,
+    /// Path whose Open job is in flight.
+    pub opening: Option<PathBuf>,
+    pub recents: Vec<Recent>,
+    /// Transient green/neutral status message (bottom bar).
+    pub status: String,
+    /// Error shown in the status bar until the next action.
+    pub error: Option<String>,
+    pub saving: bool,
+    pub exporting: bool,
+    /// egui id to focus next frame (filter box).
+    pub focus_filter_next: bool,
+}
+
+impl App {
+    /// True when there are unsaved edits.
+    pub fn dirty(&self) -> bool {
+        self.file
+            .as_ref()
+            .is_some_and(|f| !f.grid.overlay.is_empty())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Recent {
+    pub path: String,
+    pub rows: u64,
+}
+
+impl App {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        crate::theme::install(&cc.egui_ctx);
+        crate::theme::install_fonts(&cc.egui_ctx);
+        let recents: Vec<Recent> = cc
+            .storage
+            .and_then(|s| eframe::get_value(s, crate::STORAGE_KEY))
+            .unwrap_or_default();
+        match Engine::spawn() {
+            Ok(engine) => Self {
+                engine,
+                file: None,
+                opening: None,
+                recents,
+                status: "ready".into(),
+                error: None,
+                saving: false,
+                exporting: false,
+                focus_filter_next: false,
+            },
+            Err(e) => {
+                // App without a worker: show the error and nothing else.
+                Self {
+                    engine: Engine::broken(),
+                    file: None,
+                    opening: None,
+                    recents,
+                    status: format!("duckdb failed to start: {e:#}"),
+                    error: None,
+                    saving: false,
+                    exporting: false,
+                    focus_filter_next: false,
+                }
+            }
+        }
+    }
+
+    // ---- actions ---------------------------------------------------------
+
+    pub fn open_path(&mut self, path: PathBuf) {
+        self.error = None;
+        self.status = format!("opening {}", path.display());
+        self.file = None;
+        self.opening = Some(path.clone());
+        self.engine.send(Job::Open { path });
+    }
+
+    pub fn open_dialog(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("Parquet", &["parquet", "parq", "pq"])
+            .pick_file()
+        {
+            self.open_path(path);
+        }
+    }
+
+    pub fn save(&mut self) {
+        let Some(file) = self.file.as_mut() else {
+            return;
+        };
+        if self.saving || file.grid.overlay.is_empty() {
+            return;
+        }
+        let overlay: Vec<(u64, usize, EditValue)> = file
+            .grid
+            .overlay
+            .all()
+            .map(|(r, c, v)| (r, c, v.clone()))
+            .collect();
+        self.saving = true;
+        self.status = "saving\u{2026}".into();
+        self.engine.send(Job::Save {
+            overlay,
+            progress: self.engine.progress_sender(),
+        });
+    }
+
+    pub fn open_export_dialog(&mut self) {
+        let Some(file) = self.file.as_mut() else { return };
+        if self.exporting {
+            return;
+        }
+        let filter_active = file.grid.filter.is_some();
+        let default_path = file.path.with_extension("csv");
+        self.error = None;
+        file.export_dialog = Some(ExportDialog {
+            scope: if filter_active { ExportScope::Filtered } else { ExportScope::All },
+            format: ExportFormat::Csv,
+            delimiter: ';',
+            path: default_path.to_string_lossy().into_owned(),
+        });
+    }
+
+    pub fn start_export(&mut self) {
+        let Some(file) = self.file.as_ref() else { return };
+        let Some(dialog) = file.export_dialog.as_ref() else { return };
+        if self.exporting || self.saving {
+            return;
+        }
+        let path = PathBuf::from(dialog.path.trim());
+        if path.as_os_str().is_empty() {
+            self.error = Some("export path is empty".into());
+            return;
+        }
+        let filter = match (dialog.scope, file.grid.filter.as_deref()) {
+            (ExportScope::Filtered, Some(f)) => Some(f.to_string()),
+            _ => None,
+        };
+        self.exporting = true;
+        self.status = "exporting\u{2026}".into();
+        self.engine.send(Job::Export {
+            path,
+            filter,
+            format: dialog.format,
+            delimiter: dialog.delimiter,
+            progress: self.engine.progress_sender(),
+        });
+        if let Some(f) = self.file.as_mut() {
+            f.export_dialog = None;
+        }
+    }
+
+    /// Submit the filter box contents for validation + application.
+    pub fn submit_filter(&mut self) {
+        let Some(file) = self.file.as_mut() else { return };
+        let draft = file.filter_draft.trim().to_string();
+        let filter = if draft.is_empty() { None } else { Some(draft) };
+        // Same filter as applied -> nothing to do.
+        if filter.as_deref() == file.grid.filter.as_deref() {
+            file.filter_error = None;
+            return;
+        }
+        file.pending_filter = filter;
+        file.filter_error = None;
+        let epoch = file.grid.cache.epoch() + 1;
+        self.engine.send(Job::Count {
+            epoch,
+            filter: file.pending_filter.clone(),
+        });
+        self.status = "checking filter\u{2026}".into();
+    }
+
+    pub fn clear_filter(&mut self) {
+        let Some(file) = self.file.as_mut() else { return };
+        file.pending_filter = None;
+        file.filter_error = None;
+        if file.grid.filter.is_none() {
+            file.filter_draft.clear();
+            return;
+        }
+        file.apply_filter(None);
+        self.status = "filter cleared".into();
+    }
+
+    pub fn cycle_sort(&mut self, col: usize, append: bool) {
+        if let Some(f) = self.file.as_mut() {
+            f.cycle_sort(col, append);
+        }
+    }
+
+    pub fn apply_popover(&mut self) {
+        // Snapshot the popover state, then release the borrow before
+        // requerying.
+        let (col, checked, values) = {
+            let Some(file) = self.file.as_ref() else { return };
+            let Some(pop) = file.popover.as_ref() else { return };
+            (pop.col, pop.checked.clone(), pop.values.clone())
+        };
+        if let Some(f) = self.file.as_mut() {
+            f.popover = None;
+        }
+        let Some(schema) = self.file.as_ref().and_then(|f| f.grid.schema.get(col)) else {
+            return;
+        };
+        let ty = schema.ty;
+        let ident = crate::data::types::sql_ident(&schema.name);
+
+        let mut conds: Vec<String> = Vec::new();
+        let picked: Vec<&(String, u64)> = values
+            .iter()
+            .filter(|(v, _)| checked.contains(v.as_str()))
+            .collect();
+        let null_picked = checked.contains(NULL_SENTINEL);
+        if !picked.is_empty() {
+            let quoted: Vec<String> = picked
+                .iter()
+                .map(|(v, _)| match ty {
+                    crate::data::types::ColType::Integer
+                    | crate::data::types::ColType::Float
+                    | crate::data::types::ColType::Boolean => v.clone(),
+                    _ => crate::data::types::sql_quote(v),
+                })
+                .collect();
+            conds.push(format!("{ident} IN ({})", quoted.join(", ")));
+        }
+        if null_picked {
+            conds.push(format!("{ident} IS NULL"));
+        }
+        let fragment = match conds.len() {
+            0 => None,
+            _ => Some(conds.join(" OR ")),
+        };
+        // A popover filter replaces the box filter: too clever to merge into
+        // arbitrary SQL; the box filter is cleared when the popover applies.
+        if fragment.is_some() {
+            if let Some(f) = self.file.as_mut() {
+                f.filter_draft.clear();
+            }
+        }
+        if let Some(f) = self.file.as_mut() {
+            let sort = f.grid.sort.clone();
+            f.grid.requery(sort, fragment.clone());
+        }
+        self.status = match fragment {
+            Some(_) => "filter applied".into(),
+            None => "filter cleared".into(),
+        };
+    }
+
+    pub fn begin_edit(&mut self) {
+        let Some(f) = self.file.as_mut() else { return };
+        let Some(sel) = f.selection else { return };
+        f.begin_edit_at(sel.rowid, sel.col);
+    }
+
+    pub fn set_cell_null(&mut self) {
+        let Some(f) = self.file.as_mut() else { return };
+        let Some(sel) = f.selection else { return };
+        f.grid.overlay.set(sel.rowid, sel.col, EditValue::Null);
+    }
+
+    /// Move the selection by (drow, dcol), clamped to the grid. Scrolls the
+    /// view to the new row.
+    pub fn move_selection(&mut self, drow: i64, dcol: i64) {
+        let Some(file) = self.file.as_mut() else { return };
+        let total = file.shown_rows;
+        if total == 0 {
+            return;
+        }
+        let ncols = file.grid.schema.len() as i64;
+        let (row, col) = match file.selection {
+            Some(sel) => (sel.rowid as i64 + drow, sel.col as i64 + dcol),
+            None => (drow.min(0).max(0), dcol.min(0).max(0)),
+        };
+        let row = row.clamp(0, total as i64 - 1) as u64;
+        let col = col.clamp(0, ncols - 1) as usize;
+        file.selection = Some(Sel { rowid: row, col });
+        file.scroll_to_row = Some(row);
+    }
+
+    // ---- polling ---------------------------------------------------------
+
+    /// Drain worker results and progress. Called once per frame.
+    pub fn poll(&mut self) {
+        // Progress strings (export/save status).
+        while let Ok(msg) = self.engine.progress.try_recv() {
+            self.status = msg;
+        }
+        while let Ok(result) = self.engine.results.try_recv() {
+            match result {
+                JobResult::Opened { schema, total } => {
+                    let path = self.opening.take().unwrap_or_default();
+                    self.status = format!("opened {}", path.display());
+                    self.file = Some(FileState::new(path, schema, total));
+                    self.push_recent();
+                }
+                JobResult::Count { epoch, total } => {
+                    if let Some(f) = self.file.as_mut() {
+                        if f.pending_filter.is_some() {
+                            // Validation success for the candidate filter.
+                            let filter = f.pending_filter.clone();
+                            f.apply_filter(filter);
+                            f.grid.shown_rows = total;
+                            self.status =
+                                format!("{} rows match", crate::util::fmt_count(total));
+                        } else if epoch == f.grid.cache.epoch() {
+                            f.shown_rows = total;
+                            f.count_pending = false;
+                        }
+                    }
+                }
+                JobResult::Rows(batch) => {
+                    if let Some(f) = self.file.as_mut() {
+                        f.grid
+                            .cache
+                            .put_page(batch.epoch, batch.start_row / PAGE_SIZE as u64, batch.rows);
+                    }
+                }
+                JobResult::Stats(s) => {
+                    if let Some(f) = self.file.as_mut() {
+                        f.stats.retain(|old| old.col != s.col);
+                        f.stats.push(s);
+                    }
+                }
+                JobResult::TopValues { col, values, truncated } => {
+                    if let Some(f) = self.file.as_mut() {
+                        if let Some(pop) = f.popover.as_mut() {
+                            if pop.col == col {
+                                pop.values = values
+                                    .into_iter()
+                                    .map(|(v, n)| (v.display(), n))
+                                    .collect();
+                                pop.truncated = truncated;
+                                pop.loading = false;
+                            }
+                        }
+                    }
+                }
+                JobResult::Done { kind, message } => match kind {
+                    JobKind::Save => {
+                        self.saving = false;
+                        if let Some(f) = self.file.as_mut() {
+                            f.grid.overlay.clear();
+                            f.requery();
+                            let epoch = f.grid.cache.epoch();
+                            let filter = f.grid.filter.clone();
+                            self.engine.send(Job::Count { epoch, filter });
+                        }
+                        self.status = message;
+                    }
+                    JobKind::Export => {
+                        self.exporting = false;
+                        self.status = message;
+                    }
+                },
+                JobResult::Failed { source, message } => match source {
+                    FailSource::Filter => {
+                        if let Some(f) = self.file.as_mut() {
+                            f.pending_filter = None;
+                            f.filter_error = Some(message.clone());
+                        }
+                        self.status = "invalid filter".into();
+                    }
+                    FailSource::Rows => {
+                        // Row fetch failed: drop in-flight marks so the grid
+                        // can retry.
+                        if let Some(f) = self.file.as_mut() {
+                            f.grid.cache.clear_in_flight();
+                        }
+                        self.error = Some(message);
+                    }
+                    FailSource::General => {
+                        self.saving = false;
+                        self.exporting = false;
+                        self.error = Some(message);
+                    }
+                },
+            }
+        }
+    }
+
+    fn push_recent(&mut self) {
+        let Some(f) = self.file.as_ref() else { return };
+        let entry = Recent { path: f.path.to_string_lossy().into_owned(), rows: f.total_rows };
+        self.recents.retain(|r| r.path != entry.path);
+        self.recents.insert(0, entry);
+        self.recents.truncate(8);
+        // Persisted once per frame via eframe storage (see update()).
+    }
+}

@@ -1,0 +1,483 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>pqeditor · UI mockup</title>
+<style>
+  :root {
+    --bg-page: #0e1013;
+    --bg-window: #16181d;
+    --bg-panel: #1d2027;
+    --bg-header: #20232b;
+    --bg-status: #12141a;
+    --bg-hover: #1f232b;
+    --sel: #2b3a55;
+    --line: #262a33;
+    --line-strong: #2f343f;
+    --text: #c8cedb;
+    --text-dim: #5c6470;
+    --text-header: #aeb6c4;
+    --accent: #e8a13c;
+    --accent-soft: #3a3222;
+    --accent-text: #f5c877;
+    --danger: #d96c5f;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg-page);
+    color: var(--text);
+    font-family: ui-monospace, "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+    font-size: 13px;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 28px;
+    padding: 28px;
+    align-items: start;
+  }
+  .frame-label {
+    color: var(--text-dim);
+    font-size: 11px;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    margin-bottom: 8px;
+  }
+  .window {
+    background: var(--bg-window);
+    border: 1px solid var(--line-strong);
+    border-radius: 8px;
+    overflow: hidden;
+    box-shadow: 0 10px 40px rgba(0,0,0,.5);
+  }
+  /* title bar */
+  .titlebar {
+    display: flex; align-items: center; gap: 8px;
+    background: var(--bg-panel);
+    border-bottom: 1px solid var(--line);
+    padding: 7px 10px;
+    font-size: 12px;
+    color: var(--text-dim);
+  }
+  .titlebar .app { color: var(--text-header); }
+  .titlebar .dot { width: 6px; height: 6px; border-radius: 50%; }
+  .titlebar .traffic { display: flex; gap: 6px; margin-left: auto; }
+  .titlebar .traffic span { width: 10px; height: 10px; border-radius: 50%; }
+  /* toolbar */
+  .toolbar {
+    display: flex; align-items: center; gap: 10px;
+    padding: 7px 10px;
+    background: var(--bg-window);
+    border-bottom: 1px solid var(--line);
+  }
+  .btn {
+    background: var(--bg-panel);
+    border: 1px solid var(--line-strong);
+    color: var(--text-header);
+    padding: 4px 10px;
+    border-radius: 5px;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .btn.accent { border-color: #6b542a; color: var(--accent-text); }
+  .btn:disabled { opacity: .4; }
+  .tsep { width: 1px; height: 18px; background: var(--line-strong); }
+  .filterbox {
+    flex: 1;
+    display: flex; align-items: center; gap: 8px;
+    background: var(--bg-panel);
+    border: 1px solid var(--line-strong);
+    border-radius: 5px;
+    padding: 4px 10px;
+    color: var(--text-dim);
+  }
+  .filterbox .q { color: var(--accent); }
+  .filterbox input { flex: 1; background: none; border: 0; outline: none; color: var(--text); font: inherit; }
+  /* sort chips */
+  .chips { display: flex; gap: 6px; }
+  .chip {
+    display: flex; align-items: center; gap: 5px;
+    background: var(--accent-soft);
+    border: 1px solid #554421;
+    color: var(--accent-text);
+    border-radius: 5px;
+    padding: 3px 8px;
+    font-size: 11px;
+  }
+  .chip .x { color: var(--text-dim); cursor: pointer; }
+  /* grid */
+  .gridwrap { position: relative; }
+  table.grid { border-collapse: collapse; width: 100%; table-layout: fixed; }
+  .grid th, .grid td {
+    border-right: 1px solid var(--line);
+    border-bottom: 1px solid var(--line);
+    padding: 5px 9px;
+    text-align: left;
+    white-space: nowrap;
+    overflow: hidden;
+  }
+  .grid th {
+    background: var(--bg-header);
+    color: var(--text-header);
+    font-weight: 500;
+    border-bottom: 1px solid var(--line-strong);
+    position: sticky; top: 0;
+  }
+  .grid th .idx {
+    color: var(--text-dim); font-weight: 400; margin-right: 5px;
+  }
+  .grid td.num, .grid th.num { text-align: right; }
+  .grid td.dim { color: var(--text-dim); }
+  .rownum {
+    width: 44px; min-width: 44px; max-width: 44px;
+    text-align: right !important;
+    color: var(--text-dim);
+    background: var(--bg-panel);
+    border-right: 1px solid var(--line-strong) !important;
+  }
+  th.rownum { border-bottom: 1px solid var(--line-strong); }
+  tr.sel td { background: var(--sel); }
+  tr.sel td.rownum { background: #24304a; color: var(--text); }
+  .edited { position: relative; }
+  .edited::before {
+    content: "";
+    position: absolute; left: 0; top: 0; bottom: 0; width: 3px;
+    background: var(--accent);
+  }
+  .edited { color: var(--accent-text); }
+  .arrow { color: var(--accent); font-size: 10px; }
+  .funnel { color: var(--text-dim); font-size: 10px; margin-left: 6px; }
+  .funnel.on { color: var(--accent); }
+  .sortkey {
+    display: inline-block; margin-left: 4px;
+    background: var(--accent-soft); color: var(--accent-text);
+    border-radius: 3px; font-size: 9px; padding: 0 4px;
+  }
+  /* inline editor */
+  .celledit {
+    display: flex; align-items: center; justify-content: space-between;
+    background: #10131a;
+    border: 1px solid var(--accent);
+    border-radius: 4px;
+    margin: -2px -4px;
+    padding: 3px 8px;
+    color: var(--text);
+  }
+  .celledit .hint { color: var(--text-dim); font-size: 10px; }
+  /* stats strip */
+  .stats {
+    display: flex; align-items: center; gap: 4px;
+    background: var(--bg-panel);
+    border-top: 1px solid var(--line);
+    padding: 7px 10px;
+    font-size: 12px;
+    color: var(--text-dim);
+    flex-wrap: wrap;
+  }
+  .stats .cname { color: var(--text-header); }
+  .stats .v { color: var(--text); }
+  .stats .close { margin-left: auto; color: var(--text-dim); cursor: pointer; }
+  /* status bar */
+  .status {
+    display: flex; gap: 18px;
+    background: var(--bg-status);
+    border-top: 1px solid var(--line);
+    padding: 6px 10px;
+    font-size: 11.5px;
+    color: var(--text-dim);
+  }
+  .status .pending { color: var(--accent-text); }
+  /* popover */
+  .popwrap { position: relative; }
+  .popover {
+    position: absolute; top: 64px; left: 300px;
+    width: 260px;
+    background: var(--bg-panel);
+    border: 1px solid var(--line-strong);
+    border-radius: 8px;
+    box-shadow: 0 14px 40px rgba(0,0,0,.6);
+    z-index: 5;
+    font-size: 12px;
+  }
+  .popover .phead {
+    display: flex; justify-content: space-between;
+    padding: 8px 10px;
+    border-bottom: 1px solid var(--line);
+    color: var(--text-header);
+  }
+  .popover .pbody { padding: 8px 10px; display: grid; gap: 7px; }
+  .popover input[type="text"] {
+    width: 100%; background: var(--bg-window); border: 1px solid var(--line-strong);
+    border-radius: 4px; color: var(--text); font: inherit; padding: 4px 8px; outline: none;
+  }
+  .vlist { display: grid; gap: 4px; max-height: 150px; overflow: auto; }
+  .vlist label { display: flex; gap: 8px; align-items: center; color: var(--text); }
+  .vlist .cnt { color: var(--text-dim); margin-left: auto; }
+  .pfoot {
+    display: flex; gap: 8px; justify-content: flex-end;
+    border-top: 1px solid var(--line); padding: 8px 10px;
+  }
+  .dim-overlay {
+    position: absolute; inset: 0;
+    background: rgba(6,7,9,.55);
+    z-index: 4;
+  }
+  /* start screen */
+  .start {
+    display: grid; place-items: center;
+    height: 420px;
+    gap: 22px;
+    grid-auto-rows: min-content;
+    align-content: center;
+  }
+  .drop {
+    width: 380px;
+    border: 1.5px dashed var(--line-strong);
+    border-radius: 10px;
+    padding: 34px 20px;
+    text-align: center;
+    color: var(--text-dim);
+  }
+  .drop .big { color: var(--text-header); margin-bottom: 6px; }
+  .drop .kbd {
+    color: var(--accent-text);
+    border: 1px solid #554421; border-radius: 4px; padding: 0 5px;
+  }
+  .recents { width: 380px; }
+  .recents .rhead {
+    color: var(--text-dim); font-size: 11px; letter-spacing: .08em;
+    text-transform: uppercase; margin-bottom: 6px;
+  }
+  .recents .rrow {
+    display: flex; justify-content: space-between; gap: 12px;
+    padding: 5px 8px; border-radius: 5px; color: var(--text);
+  }
+  .recents .rrow:hover { background: var(--bg-hover); }
+  .recents .rrow .n { color: var(--text-dim); }
+  /* export dialog */
+  .dialog-wrap { position: relative; }
+  .dialog {
+    position: absolute; inset: 0;
+    display: grid; place-items: center;
+    background: rgba(6,7,9,.55);
+    z-index: 6;
+  }
+  .dialog .box {
+    width: 340px;
+    background: var(--bg-panel);
+    border: 1px solid var(--line-strong);
+    border-radius: 8px;
+    box-shadow: 0 14px 40px rgba(0,0,0,.6);
+    overflow: hidden;
+  }
+  .dialog .dhead {
+    padding: 9px 12px; border-bottom: 1px solid var(--line);
+    color: var(--text-header); display: flex; justify-content: space-between;
+  }
+  .dialog .dbody { padding: 12px; display: grid; gap: 10px; }
+  .field label { display: block; color: var(--text-dim); font-size: 11px; margin-bottom: 4px; }
+  .field .row { display: flex; gap: 6px; }
+  .seg { display: flex; border: 1px solid var(--line-strong); border-radius: 5px; overflow: hidden; }
+  .seg span {
+    padding: 4px 12px; font-size: 12px; color: var(--text-dim);
+    border-right: 1px solid var(--line-strong); cursor: pointer;
+  }
+  .seg span:last-child { border-right: 0; }
+  .seg span.on { background: var(--accent-soft); color: var(--accent-text); }
+  .dialog input[type="text"] {
+    width: 100%; background: var(--bg-window); border: 1px solid var(--line-strong);
+    border-radius: 4px; color: var(--text); font: inherit; padding: 5px 8px; outline: none;
+  }
+  .dialog .dfoot {
+    display: flex; justify-content: flex-end; gap: 8px;
+    border-top: 1px solid var(--line); padding: 9px 12px;
+  }
+</style>
+</head>
+<body>
+
+<!-- FRAME 1: main window -->
+<div>
+  <div class="frame-label">1 · main window: 2 sorts, 1 filter, 2 pending edits, stats strip</div>
+  <div class="window">
+    <div class="titlebar">
+      <span class="dot" style="background:#2f343f"></span>
+      <span class="app">pqeditor</span><span>·</span><span>taxi_trips.parquet</span>
+      <div class="traffic">
+        <span style="background:#2f343f"></span><span style="background:#2f343f"></span><span style="background:#2f343f"></span>
+      </div>
+    </div>
+    <div class="toolbar">
+      <button class="btn">Open</button>
+      <button class="btn accent">Save</button>
+      <button class="btn">Export…</button>
+      <div class="tsep"></div>
+      <div class="filterbox"><span class="q">⌕</span><input value="fare &gt; 100 AND payment = 'card'"></div>
+      <button class="btn">✕</button>
+      <div class="chips">
+        <span class="chip">pickup_date ▲ <span class="x">✕</span></span>
+        <span class="chip">trip_id ▲ <span class="x">✕</span></span>
+      </div>
+    </div>
+    <div class="gridwrap">
+      <table class="grid">
+        <tr>
+          <th class="rownum">▲#</th>
+          <th style="width:110px"><span class="idx"></span>trip_id<span class="sortkey">2</span></th>
+          <th style="width:120px"><span class="idx"></span>pickup_date<span class="sortkey">1</span><span class="arrow">▲</span></th>
+          <th class="num" style="width:90px">fare<span class="arrow">▼</span><span class="funnel on">▼filter</span></th>
+          <th class="num" style="width:80px">tip</th>
+          <th style="width:100px">payment<span class="funnel">◢</span></th>
+        </tr>
+        <tr><td class="rownum">481</td><td>20418</td><td>2024-03-02</td><td class="num">142.50</td><td class="num">18.00</td><td>card</td></tr>
+        <tr class="sel"><td class="rownum">1,204</td><td>20661</td><td>2024-03-02</td><td class="num edited">105.20</td><td class="num">·</td><td>card</td></tr>
+        <tr><td class="rownum">9,447</td><td>31107</td><td>2024-03-03</td><td class="num celledit-parent"><span class="celledit">112.00<span class="hint">enter ✓ · esc ✕</span></span></td><td class="num">12.50</td><td>card</td></tr>
+        <tr><td class="rownum">12,301</td><td>32988</td><td>2024-03-03</td><td class="num">100.60</td><td class="num">·</td><td>card</td></tr>
+        <tr><td class="rownum">18,920</td><td>40552</td><td>2024-03-05</td><td class="num edited">118.00</td><td class="num">15.00</td><td>card</td></tr>
+        <tr><td class="rownum">33,804</td><td>51193</td><td>2024-03-07</td><td class="num">104.30</td><td class="num">9.20</td><td>card</td></tr>
+      </table>
+    </div>
+    <div class="stats">
+      <span class="cname">fare:</span><span>n 1,204</span><span>·</span><span>nulls 12</span><span>·</span>
+      <span>distinct 187</span><span>·</span><span>min <span class="v">100.10</span></span><span>·</span>
+      <span>max <span class="v">292.00</span></span><span>·</span><span>avg <span class="v">128.44</span></span><span>·</span>
+      <span>σ <span class="v">21.8</span></span>
+      <span class="close">✕ close</span>
+    </div>
+    <div class="status">
+      <span>10,000,000 rows</span><span>1,204 shown</span><span class="pending">2 unsaved edits</span>
+    </div>
+  </div>
+</div>
+
+<!-- FRAME 2: filter popover -->
+<div>
+  <div class="frame-label">2 · column filter popover (payment), multi-select values</div>
+  <div class="window popwrap">
+    <div class="dim-overlay"></div>
+    <div class="titlebar">
+      <span class="dot" style="background:#2f343f"></span>
+      <span class="app">pqeditor</span><span>·</span><span>taxi_trips.parquet</span>
+      <div class="traffic">
+        <span style="background:#2f343f"></span><span style="background:#2f343f"></span><span style="background:#2f343f"></span>
+      </div>
+    </div>
+    <div class="toolbar">
+      <button class="btn">Open</button>
+      <button class="btn accent">Save</button>
+      <button class="btn">Export…</button>
+      <div class="tsep"></div>
+      <div class="filterbox"><span class="q">⌕</span><input placeholder="Ctrl+L · WHERE fragment"></div>
+    </div>
+    <div class="gridwrap">
+      <table class="grid">
+        <tr><th class="rownum">▲#</th><th style="width:110px">trip_id</th><th style="width:120px">pickup_date</th><th class="num" style="width:90px">fare</th><th class="num" style="width:80px">tip</th><th style="width:100px">payment</th></tr>
+        <tr><td class="rownum">481</td><td>20418</td><td>2024-03-02</td><td class="num">142.50</td><td class="num">18.00</td><td>card</td></tr>
+        <tr><td class="rownum">1,204</td><td>20661</td><td>2024-03-02</td><td class="num">105.20</td><td class="num">·</td><td>card</td></tr>
+        <tr><td class="rownum">9,447</td><td>31107</td><td>2024-03-03</td><td class="num">112.00</td><td class="num">12.50</td><td>card</td></tr>
+        <tr><td class="rownum">12,301</td><td>32988</td><td>2024-03-03</td><td class="num">100.60</td><td class="num">·</td><td>card</td></tr>
+        <tr><td class="rownum">18,920</td><td>40552</td><td>2024-03-05</td><td class="num">118.00</td><td class="num">15.00</td><td>card</td></tr>
+      </table>
+    </div>
+    <div class="status"><span>10,000,000 rows</span><span>10,000,000 shown</span></div>
+    <div class="popover">
+      <div class="phead"><span>filter · payment</span><span class="x" style="color:var(--text-dim)">esc ✕</span></div>
+      <div class="pbody">
+        <input type="text" placeholder="search values…">
+        <div class="vlist">
+          <label><input type="checkbox" checked> card <span class="cnt">6,905,441</span></label>
+          <label><input type="checkbox"> cash <span class="cnt">3,071,829</span></label>
+          <label><input type="checkbox"> unknown <span class="cnt">22,290</span></label>
+          <label><input type="checkbox"> · null <span class="cnt">440</span></label>
+        </div>
+        <div style="color:var(--text-dim);font-size:10px">top 200 · of 4 distinct</div>
+      </div>
+      <div class="pfoot">
+        <button class="btn">clear</button>
+        <button class="btn accent">apply</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- FRAME 3: export dialog -->
+<div>
+  <div class="frame-label">3 · export dialog: scope / format / delimiter / destination</div>
+  <div class="window dialog-wrap">
+    <div class="titlebar">
+      <span class="dot" style="background:#2f343f"></span>
+      <span class="app">pqeditor</span><span>·</span><span>taxi_trips.parquet</span>
+      <div class="traffic">
+        <span style="background:#2f343f"></span><span style="background:#2f343f"></span><span style="background:#2f343f"></span>
+      </div>
+    </div>
+    <div class="gridwrap">
+      <table class="grid">
+        <tr><th class="rownum">▲#</th><th style="width:110px">trip_id</th><th style="width:120px">pickup_date</th><th class="num" style="width:90px">fare</th><th class="num" style="width:80px">tip</th><th style="width:100px">payment</th></tr>
+        <tr><td class="rownum">481</td><td>20418</td><td>2024-03-02</td><td class="num">142.50</td><td class="num">18.00</td><td>card</td></tr>
+        <tr><td class="rownum">1,204</td><td>20661</td><td>2024-03-02</td><td class="num">105.20</td><td class="num">·</td><td>card</td></tr>
+        <tr><td class="rownum">9,447</td><td>31107</td><td>2024-03-03</td><td class="num">112.00</td><td class="num">12.50</td><td>card</td></tr>
+        <tr><td class="rownum">12,301</td><td>32988</td><td>2024-03-03</td><td class="num">100.60</td><td class="num">·</td><td>card</td></tr>
+        <tr><td class="rownum">18,920</td><td>40552</td><td>2024-03-05</td><td class="num">118.00</td><td class="num">15.00</td><td>card</td></tr>
+      </table>
+    </div>
+    <div class="status"><span>10,000,000 rows</span><span>1,204 shown</span></div>
+    <div class="dialog"><div class="box">
+      <div class="dhead"><span>Export</span><span style="color:var(--text-dim)">esc ✕</span></div>
+      <div class="dbody">
+        <div class="field">
+          <label>scope</label>
+          <div class="seg"><span class="on">filtered (1,204 rows)</span><span>all (10,000,000)</span></div>
+        </div>
+        <div class="field">
+          <label>format</label>
+          <div class="seg"><span class="on">xlsx</span><span>csv</span></div>
+        </div>
+        <div class="field">
+          <label>csv delimiter</label>
+          <div class="seg"><span class="on">;</span><span>,</span><span>tab</span><span>|</span></div>
+        </div>
+        <div class="field">
+          <label>destination</label>
+          <input type="text" value="/home/andrey/taxi_export.xlsx">
+        </div>
+        <div style="color:var(--text-dim);font-size:10.5px">
+          xlsx: bold frozen header · autofit columns · autofilter · utf-8 · types preserved<br>
+          csv: utf-8 with BOM · edits included · runs in background
+        </div>
+      </div>
+      <div class="dfoot">
+        <button class="btn">cancel</button>
+        <button class="btn accent">export</button>
+      </div>
+    </div></div>
+  </div>
+</div>
+
+<!-- FRAME 4: start screen -->
+<div>
+  <div class="frame-label">4 · start state: drop zone + recents</div>
+  <div class="window">
+    <div class="titlebar">
+      <span class="dot" style="background:#2f343f"></span>
+      <span class="app">pqeditor</span>
+      <div class="traffic">
+        <span style="background:#2f343f"></span><span style="background:#2f343f"></span><span style="background:#2f343f"></span>
+      </div>
+    </div>
+    <div class="start">
+      <div class="drop">
+        <div class="big">Drop a .parquet file</div>
+        <div>or press <span class="kbd">Ctrl</span>+<span class="kbd">O</span> to browse</div>
+      </div>
+      <div class="recents">
+        <div class="rhead">recent</div>
+        <div class="rrow"><span>taxi_trips.parquet</span><span class="n">10.0M rows</span></div>
+        <div class="rrow"><span>sales_2024.parquet</span><span class="n">2.3M rows</span></div>
+        <div class="rrow"><span>users.parquet</span><span class="n">84K rows</span></div>
+      </div>
+    </div>
+    <div class="status"><span>ready</span></div>
+  </div>
+</div>
+
+</body>
+</html>
