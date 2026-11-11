@@ -20,6 +20,10 @@ font is bundled. Copy it anywhere and run it.
 
 ## What it does
 
+The repo ships `test-data.parquet` (100,000 rows: ints, floats, text with
+nulls, booleans, dates, timestamps) as the standard file to try the app on.
+Regenerate or resize it with `cargo run --example make_test_parquet -- out.parquet [rows]`.
+
 - Opens parquet files by drag-and-drop, file dialog, or double-click
   (via file association you set up yourself)
 - Virtualized grid: scroll through 10M rows; only visible rows are fetched

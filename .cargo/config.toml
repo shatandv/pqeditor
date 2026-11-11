@@ -8,3 +8,8 @@ jobs = 2
 [env]
 NUM_JOBS = "2"
 CMAKE_BUILD_PARALLEL_LEVEL = "2"
+
+# Windows cross-build via llvm-mingw (installed to ~/.local/llvm-mingw-*).
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"
+ar = "x86_64-w64-mingw32-ar"
