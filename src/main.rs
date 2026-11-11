@@ -29,6 +29,9 @@ fn main() {
             .with_inner_size([1280.0, 800.0])
             .with_min_inner_size([720.0, 420.0])
             .with_icon(load_icon()),
+        // OpenGL renderer: broader driver/device compatibility than wgpu
+        // (which needs Vulkan or D3D12).
+        renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
     eframe::run_native("pqeditor", options, Box::new(|cc| Ok(Box::new(app::App::new(cc)))))

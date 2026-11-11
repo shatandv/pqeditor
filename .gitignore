@@ -2,3 +2,4 @@
 *.parquet.tmp
 ~$*
 .DS_Store
+/dist

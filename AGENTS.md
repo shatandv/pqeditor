@@ -76,13 +76,39 @@ mockup.html      visual spec of the UI (open in a browser)
 ## Verification checklist before declaring anything "works"
 
 1. `cargo check` clean, `cargo test` green.
-2. Generate a test parquet (see tests/), open in the app: rows appear,
+2. Generate a test parquet (see examples/), open in the app: rows appear,
    scroll to the far end fast, sort/filter, edit a cell, Ctrl+S, reopen:
    edit persisted, order unchanged.
 3. Export CSV with a `;` delimiter: BOM present, delimiter correct.
    Export XLSX: opens in LibreOffice/Excel, filter row present.
 4. Bad filter input: red error, previous filter intact.
 5. Edit rejected for type mismatch: editor stays open, red message.
+
+## PAUSED WORK (2026-11-12, resume here)
+
+State: 18/18 tests green, Linux build runs clean. Windows cross-build
+proven end-to-end (exe produced; needs libc++.dll + libunwind.dll beside
+it, already in `dist/`). Wine smoke-test found one bug:
+
+- eframe default renderer is wgpu (Vulkan/D3D12), which fails under Wine
+  (`Wgpu(RequestDeviceError)`). Fix in progress: set
+  `renderer: eframe::Renderer::Glow` in `src/main.rs` `NativeOptions`.
+  That edit is applied but does NOT compile yet: `E0599` on
+  `eframe::Renderer::Glow`. Almost certainly the eframe dep needs the
+  `glow` feature enabled explicitly:
+  `eframe = { version = "0.37.0", features = ["persistence", "glow"] }`
+  (check eframe 0.37 default features first). Then:
+  1. `cargo check` (fast) to confirm.
+  2. Rebuild exe (rustflags untouched, so expect ~20 min at the 2-job
+     cap; only main.rs changed, so likely just a relink unless eframe
+     features changed, which forces dep rebuild).
+  3. Copy to `dist/`, re-run Wine smoke test
+     (`cd dist && timeout 30 wine pqeditor.exe`; exit code 124 or a
+     clean window = success; grep wine log for `panicked`).
+  4. Commit, then tell the user dist/ holds: pqeditor.exe +
+     libc++.dll + libunwind.dll + test-data.parquet.
+- Renderer change also benefits Linux (glow works on X11 there; already
+  tested).
 
 ## Build/run
 
@@ -91,5 +117,23 @@ cargo check / cargo test / cargo run --release
 ```
 
 Release binary is self-contained (bundled DuckDB, bundled font).
-Cross-compiling to Windows: not wired up yet; use CI or a Windows
-machine with MSVC + CMake.
+
+## Windows cross-build (from this Linux box)
+
+Toolchain: llvm-mingw in `~/.local/llvm-mingw-*` (self-contained tarball
+from github.com/mstorsjo/llvm-mingw, no root), rust target
+`x86_64-pc-windows-gnullvm` (installed via rustup). Linker config lives in
+`.cargo/config.toml`. Build:
+
+```
+export PATH="$HOME/.local/llvm-mingw-20240619-ucrt-ubuntu-20.04-x86_64/bin:$PATH"
+export CC_x86_64_pc_windows_gnullvm=x86_64-w64-mingw32-clang
+export CXX_x86_64_pc_windows_gnullvm=x86_64-w64-mingw32-clang++
+cargo build --release --target x86_64-pc-windows-gnullvm
+```
+
+Output: `target/x86_64-pc-windows-gnullvm/release/pqeditor.exe`. Do NOT
+use the plain `x86_64-pc-windows-gnu` target: its link step wants GNU
+libstdc++/libgcc which llvm-mingw does not ship. The C++ runtime for
+DuckDB comes from llvm-mingw's libc++ (`-lc++`, emitted by
+libduckdb-sys). Smoke-test locally with `wine pqeditor.exe`.

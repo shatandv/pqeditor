@@ -10,6 +10,12 @@ NUM_JOBS = "2"
 CMAKE_BUILD_PARALLEL_LEVEL = "2"
 
 # Windows cross-build via llvm-mingw (installed to ~/.local/llvm-mingw-*).
-[target.x86_64-pc-windows-gnu]
+# The `gnullvm` target is the supported pairing with llvm-mingw (the plain
+# gnu target wants GNU libstdc++/libgcc, which llvm-mingw does not ship).
+[target.x86_64-pc-windows-gnullvm]
 linker = "x86_64-w64-mingw32-gcc"
 ar = "x86_64-w64-mingw32-ar"
+# NOTE: no rustflags here. Forcing static libc++ duplicates symbols with the
+# copy embedded in the bundled DuckDB static build. The exe depends on
+# llvm-mingw's libc++.dll + libunwind.dll, which ship alongside it in dist/
+# (see AGENTS.md).
