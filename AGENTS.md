@@ -84,57 +84,83 @@ mockup.html      visual spec of the UI (open in a browser)
 4. Bad filter input: red error, previous filter intact.
 5. Edit rejected for type mismatch: editor stays open, red message.
 
-## FEEDBACK ROUND 2 (Nov 13 late) — DIAGNOSIS + PLAN (tests first!)
+## FEEDBACK ROUND 2 (Nov 13-14) — ALL FIXED, verified via Wine+XTEST loop
 
-USER RULE (permanent, this is my codebase): before fixing anything, add
-tests that pin currently-CORRECT behavior; run the full battery after
-every round; do a full functional pass (open/sort/filter/edit/save/copy/
-paste/delete/drop/export) via the Wine+xgrab loop before shipping.
+USER RULE (permanent): before fixing anything, add tests that pin
+correct behavior; run the full battery after every round; do a full
+functional pass (open/sort/filter/edit/save/copy/paste/delete/drop/
+export) via the Wine loop before shipping. There is a pre-push hook now
+(.githooks/pre-push via `git config core.hooksPath .githooks`): fmt +
+clippy -D warnings + full test suite run on every push.
 
-ROOT CAUSE identified (fix FIRST, explains #3/#4/#6 + latent sort bug):
-the grid addresses cells by VIEW POSITION (row_idx from egui_extras) but
-the model treats it as the ORIGINAL rowid. Under sort (display order !=
-file order) and after row deletion (view excludes rows) every cell
-lookup hits the wrong row: copy/delete act on wrong rows, sorted data is
-silently wrong. FIX: Job::Rows must return the true __rowid per row
-(engine: add __rowid to the rows SELECT and split it out), cache pages
-store (rowid, cells), model addresses by position and keys overlay by
-true rowid; Sel = view positions; delete_selected_rows maps positions
-to rowids through the cache. Add an App-level test: sort by column, then
-assert the first displayed row's DATA actually changed.
+WHAT THE ROUND FOUND (root causes, all fixed + pinned by tests):
+- Position-vs-rowid mapping: the grid addressed rows by display position
+  but keyed edits/deletes by rowid. Job::Rows now returns true __rowid
+  per row; cache pages store (rowid, cells); Cell.pos is the view
+  position and actions resolve pos -> rowid via GridState::rowid_at.
+  Row-number column displays the true rowid (stable under sort).
+  App tests: sorted_edit_lands_on_the_row_you_see,
+  sorted_delete_removes_the_row_you_see, sorted_view_shows_sorted_values.
+- Sort cycle could never leave ascending (cycle_sort cleared the stack
+  first). Fixed; header RMB has a real sort-descending now. Test:
+  sort_click_cycles_asc_desc_off.
+- Enter-to-start-edit flashed and committed itself: the editor gained
+  focus in its creation frame while the initiating Enter was still in
+  the input state -> immediate commit. EditState.created_frame makes the
+  editor ignore its creation frame's Enter. Focus guard: click-away
+  commit only after the editor really held focus (EditState.had_focus).
+- Header clicks AND row-number clicks dead: selectable text labels
+  swallowed the clicks. ALL grid labels (cells, headers, rownum) are now
+  Label::selectable(false).sense(hover).
+- Drag-select never extended: is_pointer_button_down_on is only true for
+  the press-origin widget. Now: primary_down + rect_contains_pointer;
+  drag_select is cleared on any pointer release (a drag's release never
+  lands as clicked()).
+- Copy/paste never fired: egui-winit converts Ctrl+C/X/V into
+  Event::Copy/Cut/Paste and emits NO key event. handle_keys now reacts
+  to those events (when no text field is focused). egui's own clipboard
+  is used (arboard dropped from Cargo.toml).
+- Sort/RMB-sort blanked the table: the header apply path called
+  FileState::cycle_sort which requeries but never sends count(*) ->
+  cache total stayed 0 -> "no rows". grid.rs now sends the count after
+  sort events. Also the earlier broken cycle hid this.
+- "shown" count: there were TWO shown_rows fields (FileState + GridState);
+  the filter path updated the grid one, the status bar read the file one.
+  Now only GridState::shown_rows exists. Empty-draft submit clears the
+  active filter directly (no validation roundtrip). Tests:
+  filter_updates_shown_count, empty_submit_clears_active_filter.
+- Export modal runaway width: Modal auto-sizes to content; the path
+  TextEdit at desired_width(INFINITY) fed back into the width every
+  frame. Now ui.set_width(480.0) pins the content width.
 
-Other items:
-- #1 Enter-starts-edit flashes and disappears + phantom edit marker:
-  not yet explained. commit_editing no-ops on unchanged text, so
-  something sets text != initial. Reproduce via Wine + cua-driver keys
-  (wine windows ARE X11, XTEST works) + xgrab screenshots per step.
-- #2 LMB click/double-click dead: suspect the drag-select press block
-  (is_pointer_button_down_on) fighting clicks + micro-movement extends
-  the rect to neighbors (user's screenshot shows exactly that). 
-  Rework: press sets anchor only if drag not active; only extend when
-  the pointer actually moves to a different cell while down.
-- #3 copy/paste: copy uses the rect (root cause above). Paste: egui
-  Event::Paste may not fire on Windows — plan: use the `arboard` crate
-  for clipboard read/write instead of relying on egui events.
-- #5 drag-select selects text like a paragraph: egui labels are text-
-  selectable now; use Label::selectable(false) on cell labels (verify
-  the API in egui 0.37).
-- #6 sort/RMB-sort blanks the table: verify after the mapping fix; add
-  App-level test asserting first-row data changes after sort.
-- #7 shown count wrong + empty-filter Enter doesn't clear: add app test
-  for submit_filter -> shown_rows; empty draft with an active filter
-  must clear it (currently early-returns because both are None).
-- #8 Export modal grows on every input: auto-sized Modal + TextEdit
-  desired_width(INFINITY) = runaway width. Fix: Modal with fixed size
-  (Modal::area(Area::new(id).fixed_size([480, 0]))) and finite TextEdit
-  widths.
+VERIFICATION TOOLING (rebuild if /tmp was wiped):
+- /tmp/opencode/xgrab.c -> xgrab: `gcc xgrab.c -o xgrab -lX11`; grabs an
+  X11 window by id to raw RGB ("XRGB W H\n" header). /tmp/opencode/
+  topng.py wraps RGB into PNG. /tmp/opencode/xtest.c -> xtest:
+  `gcc xtest.c -o xtest -lX11 -lXtst` — XTEST injector (move/click/drag/
+  key/combo/type/down/up/focus/activate/getfocus/moveresize).
+- IMPORTANT: this box is Wayland; cua-driver cannot target XWayland
+  windows and XTEST on the main :0 display does NOT reach wine. The
+  working setup: nested `Xwayland :99 -geometry 1280x800`, run wine
+  apps with DISPLAY=:99, grab/inject on :99. Wine windows may need
+  `moveresize <wid> 0 0 1270 790` to fit; after XMoveResizeWindow the
+  app's cached position is stale by the OLD offset — clicks must be
+  real_x = egui_x + 4, real_y = egui_y + 30. Keyboard focus is flaky:
+  verify a key took effect (e.g. Down creates a selection) before
+  trusting any keyboard-driven test; refocus and retry if not.
+- Modal/context-menu surfaces do not render under wine+glow on :99
+  (black body) — environment artifact; modal width is verifiable from
+  the frame outline. eframe __screenshot saves a white buffer here.
 
-PUSHED: https://github.com/shatandv/pqeditor.git (main). dist/ is
-gitignored (57MB binary); cross/static .a files are committed.
-
-GITHUB PUSH PROCEDURE: git remote add origin
-https://github.com/shatandv/pqeditor.git && git push -u origin main
-(auth via gh or stored credentials — check what works).
+KNOWN LEFTOVERS (candidates for next round):
+- Wine keyboard focus flakiness is harness-side, but the app could
+  re-request focus after clicks if real Windows shows anything similar.
+- Unsaved-changes confirm dialog renders (logic verified round 1); the
+  Wine loop can't paint modals so re-verify on real Windows.
+- Status bar "rows" shows the file total; after unsaved deletions the
+  view total only appears via "shown" with a filter. Consider showing
+  the live view count.
+- Visual polish toward mockup.html (#10) remains soft.
 
 
 ## Build/run

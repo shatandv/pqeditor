@@ -142,10 +142,17 @@ pub fn draw(ui: &mut Ui, app: &mut App) {
         });
 
     // Deferred header actions (needs &mut file, which the closures released).
+    let mut sorted = false;
     for event in header_events {
         match event {
-            HeaderEvent::Sort { col, append } => file.cycle_sort(col, append),
-            HeaderEvent::SortDesc { col } => file.set_sort_desc(col),
+            HeaderEvent::Sort { col, append } => {
+                file.cycle_sort(col, append);
+                sorted = true;
+            }
+            HeaderEvent::SortDesc { col } => {
+                file.set_sort_desc(col);
+                sorted = true;
+            }
             HeaderEvent::Filter { col } => {
                 if file.grid.schema.get(col).is_some() {
                     let pop = crate::app::FilterPopover::new(col);
@@ -185,6 +192,21 @@ pub fn draw(ui: &mut Ui, app: &mut App) {
             HeaderEvent::DropCol { col } => file.drop_col(col),
         }
     }
+    // A sort requery reset the cache total to 0; the grid would render "no
+    // rows" until a count answers. FileState::cycle_sort does not send one
+    // (it has no engine), so send it here.
+    if sorted {
+        let epoch = file.grid.cache.epoch();
+        let filter = file.grid.filter.clone();
+        engine.send(Job::Count { epoch, filter });
+    }
+
+    // Any pointer release ends a drag-select. A drag's release never lands
+    // as `clicked()` on the release cell (press started elsewhere), so the
+    // per-cell path cannot clear it.
+    if file.drag_select.is_some() && ui.input(|i| i.pointer.any_released()) {
+        file.drag_select = None;
+    }
 
     // Request pages the visible rows need (plus one page ahead).
     // missing_pages marks pages in-flight and dedups.
@@ -220,6 +242,7 @@ fn draw_header_cell(
 ) {
     ui.spacing_mut().item_spacing.x = 4.0;
     let mut label = RichText::new(name).color(theme::TEXT_HEADER).size(12.5);
+    let mut rank_label: Option<RichText> = None;
     if let Some(pos) = sort.iter().position(|k| k.col == col) {
         let key = sort[pos];
         let arrow = if key.ascending {
@@ -232,7 +255,7 @@ fn draw_header_cell(
             .size(12.5);
         if sort.len() > 1 {
             ui.spacing_mut().item_spacing.x = 2.0;
-            ui.label(
+            rank_label = Some(
                 RichText::new((pos + 1).to_string())
                     .color(theme::ACCENT_TEXT)
                     .size(9.0)
@@ -240,10 +263,18 @@ fn draw_header_cell(
             );
         }
     }
-    ui.label(label);
-    let is_filtered = filter.is_some_and(|f| f.contains(name));
-    if is_filtered {
-        ui.label(RichText::new("\u{25be}").color(theme::ACCENT).size(10.0));
+    // Non-selectable labels: selectable text would swallow the header's
+    // clicks (same root cause as the dead cell clicks).
+    ui.add(Label::new(label).selectable(false).sense(Sense::hover()));
+    if let Some(rank) = rank_label {
+        ui.add(Label::new(rank).selectable(false).sense(Sense::hover()));
+    }
+    if filter.is_some_and(|f| f.contains(name)) {
+        ui.add(
+            Label::new(RichText::new("\u{25be}").color(theme::ACCENT).size(10.0))
+                .selectable(false)
+                .sense(Sense::hover()),
+        );
     }
 
     // Extend the hit area to the full header cell and track clicks.
@@ -253,8 +284,10 @@ fn draw_header_cell(
         Sense::click(),
     );
     if resp.clicked() {
-        let append = ui.input(|i| i.modifiers.shift);
-        events.push(HeaderEvent::Sort { col, append });
+        events.push(HeaderEvent::Sort {
+            col,
+            append: ui.input(|i| i.modifiers.shift),
+        });
     }
     resp.context_menu(|ui| {
         if ui.button("sort ascending").clicked() {
@@ -322,14 +355,18 @@ fn draw_rownum_cell(
     // sort); fall back to the view position while loading.
     let shown = file.grid.rowid_at(pos).unwrap_or(pos);
     ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-        ui.label(
-            RichText::new(fmt_count(shown))
-                .color(if selected {
-                    theme::TEXT
-                } else {
-                    theme::TEXT_DIM
-                })
-                .size(11.0),
+        ui.add(
+            Label::new(
+                RichText::new(fmt_count(shown))
+                    .color(if selected {
+                        theme::TEXT
+                    } else {
+                        theme::TEXT_DIM
+                    })
+                    .size(11.0),
+            )
+            .selectable(false)
+            .sense(Sense::hover()),
         );
     });
 }
@@ -415,9 +452,11 @@ fn draw_cell(
         );
     }
 
-    // Drag select: press on a cell starts the rect; moving while held
-    // extends it; release finalizes.
-    if resp.is_pointer_button_down_on() {
+    // Drag select: while the primary button is held, every cell the pointer
+    // passes over extends the rect. (is_pointer_button_down_on is only true
+    // for the press-origin widget, which never extends.)
+    let dragging = ui.input(|i| i.pointer.primary_down()) && ui.rect_contains_pointer(rect);
+    if dragging {
         match file.drag_select {
             None => {
                 file.drag_select = Some(crate::app::Cell { pos, col });
@@ -497,8 +536,14 @@ fn draw_editor(ui: &mut Ui, file: &mut crate::app::FileState) {
     if resp.has_focus() {
         edit.had_focus = true;
     }
+    if edit.created_frame == u64::MAX {
+        edit.created_frame = ui.ctx().cumulative_frame_nr();
+    }
     let (enter, esc) = ui.input(|i| (i.key_pressed(Key::Enter), i.key_pressed(Key::Escape)));
-    if resp.has_focus() && enter {
+    // Commit on Enter only after the creation frame: the Enter that STARTED
+    // the edit is still in this frame's input state.
+    let past_creation = ui.ctx().cumulative_frame_nr() > edit.created_frame;
+    if resp.has_focus() && enter && past_creation {
         file.commit_editing();
     } else if resp.has_focus() && esc {
         file.editing = None;

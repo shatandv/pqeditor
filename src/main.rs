@@ -236,12 +236,11 @@ impl app::App {
             self.move_selection(i64::MAX / 2, 0, shift);
         }
 
-        let (f2, enter, del, c) = ctx.input(|i| {
+        let (f2, enter, del) = ctx.input(|i| {
             (
                 i.key_pressed(Key::F2),
                 i.key_pressed(Key::Enter),
                 i.key_pressed(Key::Delete),
-                i.key_pressed(Key::C),
             )
         });
         if f2 || enter {
@@ -261,18 +260,31 @@ impl app::App {
             }
         } else if ctrl && del {
             self.set_cell_null();
-        } else if ctrl && c {
-            self.copy_selection();
-        } else if ctrl && ctx.input(|i| i.key_pressed(Key::V)) {
-            // The OS clipboard is read directly (arboard): egui's Paste
-            // event is unreliable across platforms.
-            match clipboard_text() {
-                Ok(text) => {
-                    if !text.is_empty() {
-                        self.paste_tsv(&text);
+        }
+
+        // Ctrl+C / Ctrl+X / Ctrl+V never arrive as key events: egui-winit
+        // converts them to Copy / Cut / Paste events before egui sees them.
+        // React to those, but only when no text field has focus (a focused
+        // TextEdit handles the clipboard natively).
+        if focus_free && !dialog_open {
+            let (copy, paste) = ctx.input(|i| {
+                let mut copy = false;
+                let mut paste = None;
+                for event in &i.raw.events {
+                    match event {
+                        egui::Event::Copy | egui::Event::Cut => copy = true,
+                        egui::Event::Paste(text) => paste = Some(text.clone()),
+                        _ => {}
                     }
                 }
-                Err(e) => self.error = Some(format!("clipboard: {e}")),
+                (copy, paste)
+            });
+            if copy {
+                self.copy_selection(&ctx);
+            } else if let Some(text) = paste
+                && !text.is_empty()
+            {
+                self.paste_tsv(&text);
             }
         }
 
@@ -295,33 +307,19 @@ impl app::App {
         }
     }
 
-    fn copy_selection(&mut self) {
+    fn copy_selection(&mut self, ctx: &egui::Context) {
         let text = self.file.as_mut().and_then(|f| {
             f.selection
                 .as_ref()
                 .and_then(|sel| f.grid.copy_rect(sel, 1_000_000))
         });
         if let Some(text) = text {
-            match set_clipboard_text(&text) {
-                Ok(()) => self.status = "copied".into(),
-                Err(e) => self.error = Some(format!("clipboard: {e}")),
-            }
+            // egui's clipboard goes through eframe's own arboard instance;
+            // the Paste event reads the same clipboard back.
+            ctx.copy_text(text);
+            self.status = "copied".into();
         }
     }
-}
-
-/// Read the OS clipboard via arboard (works on Windows/Linux/macOS).
-fn clipboard_text() -> Result<String, String> {
-    arboard::Clipboard::new()
-        .and_then(|mut c| c.get_text())
-        .map_err(|e| e.to_string())
-}
-
-/// Write the OS clipboard via arboard.
-fn set_clipboard_text(text: &str) -> Result<(), String> {
-    arboard::Clipboard::new()
-        .and_then(|mut c| c.set_text(text.to_string()))
-        .map_err(|e| e.to_string())
 }
 
 impl app::App {

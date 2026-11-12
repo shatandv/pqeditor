@@ -140,6 +140,7 @@ impl FileState {
             initial: text.clone(),
             text,
             had_focus: false,
+            created_frame: u64::MAX,
         });
     }
 
@@ -218,6 +219,10 @@ pub struct EditState {
     /// click-away commit only fires after this, so a focus race cannot
     /// silently commit a half-open editor.
     pub had_focus: bool,
+    /// Frame the editor first rendered in. The Enter that STARTED the edit
+    /// is still in the input state of this frame; the editor must not
+    /// consume it as a commit.
+    pub created_frame: u64,
 }
 
 /// The per-column filter popover.
