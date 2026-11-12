@@ -29,6 +29,8 @@ enum HeaderEvent {
     Filter { col: usize },
     Stats { col: usize },
     CopyName { col: usize },
+    SelectCol { col: usize },
+    DropCol { col: usize },
 }
 
 pub fn draw(ui: &mut Ui, app: &mut App) {
@@ -39,11 +41,19 @@ pub fn draw(ui: &mut Ui, app: &mut App) {
     let total = file.grid.cache.total() as usize;
     let ncols = file.grid.schema.len();
 
+    // Deleted columns are hidden client-side; indices stay stable because
+    // save uses EXCLUDE instead of rewriting the schema in place.
+    let visible_cols: Vec<usize> = (0..ncols)
+        .filter(|c| !file.grid.overlay.is_col_deleted(*c))
+        .collect();
+    let ncols_visible = visible_cols.len();
+
     let schema = file.grid.schema.clone();
     let sort_state = file.grid.sort.clone();
     let filter_text = file.grid.filter.clone();
     let scroll_to = file.scroll_to_row.take().map(|r| r as usize);
-    let selection_row = file.selection.map(|s| s.rowid);
+    let sel_rect = file.selection.map(|s| s.rect(total as u64, ncols));
+    let sel_head = file.selection.map(|s| s.head);
 
     let mut header_events: Vec<HeaderEvent> = Vec::new();
     // Visible row range, filled during the body pass for page requests.
@@ -52,7 +62,7 @@ pub fn draw(ui: &mut Ui, app: &mut App) {
     egui::CentralPanel::default()
         .frame(egui::Frame::NONE.fill(theme::BG_WINDOW))
         .show(ui, |ui| {
-            if total == 0 {
+            if total == 0 || ncols_visible == 0 {
                 empty_state(ui, file);
                 return;
             }
@@ -65,7 +75,7 @@ pub fn draw(ui: &mut Ui, app: &mut App) {
                 .column(Column::exact(ROWNUM_WIDTH))
                 .vscroll(true)
                 .auto_shrink([false, false]);
-            for _ in 0..ncols {
+            for _ in 0..ncols_visible {
                 table = table
                     .column(Column::initial(COL_DEFAULT_WIDTH).resizable(true).clip(true));
             }
@@ -77,6 +87,7 @@ pub fn draw(ui: &mut Ui, app: &mut App) {
             table
                 .header(HEADER_HEIGHT, {
                     let events = &mut header_events;
+                    let visible = &visible_cols;
                     move |mut header| {
                         header.col(|ui| {
                             ui.with_layout(
@@ -90,9 +101,10 @@ pub fn draw(ui: &mut Ui, app: &mut App) {
                                 },
                             );
                         });
-                        for (i, col) in schema.iter().enumerate() {
+                        for &ci in visible.iter() {
+                            let col = &schema[ci];
                             header.col(|ui| {
-                                draw_header_cell(ui, events, i, &col.name, &sort_state, filter_text.as_ref());
+                                draw_header_cell(ui, events, ci, &col.name, &sort_state, filter_text.as_ref());
                             });
                         }
                     }
@@ -105,12 +117,16 @@ pub fn draw(ui: &mut Ui, app: &mut App) {
                             Some((lo, hi)) => (lo.min(row_idx), hi.max(row_idx)),
                             None => (row_idx, row_idx),
                         });
+                        // Row tint: any row inside the selection rect; the
+                        // head cell gets its own frame (see draw_cell).
+                        let row_selected = sel_rect
+                            .is_some_and(|(r0, r1, _, _)| rowid >= r0 && rowid <= r1);
                         row.col(|ui| {
-                            draw_rownum_cell(ui, selection_row == Some(rowid), rowid);
+                            draw_rownum_cell(ui, file, rowid, row_selected, ncols);
                         });
-                        for col in 0..ncols {
+                        for &col in visible_cols.iter() {
                             row.col(|ui| {
-                                draw_cell(ui, file, rowid, col, selection_row);
+                                draw_cell(ui, file, rowid, col, sel_rect, sel_head);
                             });
                         }
                     });
@@ -145,6 +161,19 @@ pub fn draw(ui: &mut Ui, app: &mut App) {
                     ui.ctx().copy_text(c.name.clone());
                 }
             }
+            HeaderEvent::SelectCol { col } => {
+                let total = file.grid.cache.total();
+                if total > 0 {
+                    file.selection = Some(crate::app::Sel {
+                        anchor: crate::app::Cell { rowid: 0, col },
+                        head: crate::app::Cell {
+                            rowid: total - 1,
+                            col,
+                        },
+                    });
+                }
+            }
+            HeaderEvent::DropCol { col } => file.drop_col(col),
         }
     }
 
@@ -232,6 +261,14 @@ fn draw_header_cell(
             events.push(HeaderEvent::Stats { col });
             ui.close();
         }
+        if ui.button("select column").clicked() {
+            events.push(HeaderEvent::SelectCol { col });
+            ui.close();
+        }
+        if ui.button("drop column").clicked() {
+            events.push(HeaderEvent::DropCol { col });
+            ui.close();
+        }
         if ui.button("copy column name").clicked() {
             events.push(HeaderEvent::CopyName { col });
             ui.close();
@@ -239,9 +276,35 @@ fn draw_header_cell(
     });
 }
 
-fn draw_rownum_cell(ui: &mut Ui, selected: bool, rowid: u64) {
+fn draw_rownum_cell(
+    ui: &mut Ui,
+    file: &mut crate::app::FileState,
+    rowid: u64,
+    selected: bool,
+    ncols: usize,
+) {
     if selected {
         paint_row_bg(ui, theme::BG_SELECT);
+    }
+    // Clicking the row number selects the whole row (Excel-style).
+    let resp = ui.interact(
+        ui.max_rect(),
+        ui.scope_id().with(("pq-rownum", rowid)),
+        Sense::click(),
+    );
+    if resp.clicked() && !ui.input(|i| i.modifiers.shift) {
+        if file.editing.is_some() {
+            file.commit_editing();
+        }
+        file.selection = Some(crate::app::Sel::single_full_row(rowid, ncols));
+    } else if resp.clicked() {
+        // Shift+click extends the row selection.
+        if let Some(sel) = file.selection.as_mut() {
+            sel.head = crate::app::Cell { rowid, col: ncols.saturating_sub(1) };
+        }
+    }
+    if resp.double_clicked() {
+        // Double-click a row number: nothing extra (selection already set).
     }
     ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
         ui.label(
@@ -252,9 +315,18 @@ fn draw_rownum_cell(ui: &mut Ui, selected: bool, rowid: u64) {
     });
 }
 
-fn draw_cell(ui: &mut Ui, file: &mut crate::app::FileState, rowid: u64, col: usize, selection_row: Option<u64>) {
-    let selected = selection_row == Some(rowid);
-    if selected {
+fn draw_cell(
+    ui: &mut Ui,
+    file: &mut crate::app::FileState,
+    rowid: u64,
+    col: usize,
+    sel_rect: Option<(u64, u64, usize, usize)>,
+    sel_head: Option<crate::app::Cell>,
+) {
+    let (r0, r1, c0, c1) = sel_rect.unwrap_or((u64::MAX, 0, usize::MAX, 0));
+    let in_rect = rowid >= r0 && rowid <= r1 && col >= c0 && col <= c1;
+    let head_here = sel_head.is_some_and(|h| h.rowid == rowid && h.col == col);
+    if in_rect {
         paint_row_bg(ui, theme::BG_SELECT);
     }
 
@@ -280,7 +352,7 @@ fn draw_cell(ui: &mut Ui, file: &mut crate::app::FileState, rowid: u64, col: usi
         Sense::click(),
     );
 
-    // Backgrounds: edited marker, selected-cell fill.
+    // Backgrounds: edited marker, selection fill.
     if cell.edited {
         ui.painter().rect_filled(
             egui::Rect::from_min_size(rect.min, egui::vec2(2.0, rect.height())),
@@ -288,8 +360,10 @@ fn draw_cell(ui: &mut Ui, file: &mut crate::app::FileState, rowid: u64, col: usi
             theme::ACCENT,
         );
     }
-    let selected_cell = selected && file.selection.is_some_and(|s| s.col == col);
-    if selected_cell {
+    if in_rect {
+        ui.painter().rect_filled(rect, 0.0, theme::BG_SELECT);
+    }
+    if head_here {
         ui.painter().rect_filled(rect, 0.0, theme::BG_SELECT_CELL);
     }
 
@@ -305,13 +379,33 @@ fn draw_cell(ui: &mut Ui, file: &mut crate::app::FileState, rowid: u64, col: usi
         .sense(Sense::hover())
         .halign(if numeric { Align::Max } else { Align::Min });
     ui.put(rect, label);
-    if selected_cell {
+    if head_here {
         ui.painter().rect_stroke(
             rect,
             0.0,
             egui::Stroke::new(1.5, theme::ACCENT),
             egui::StrokeKind::Inside,
         );
+    }
+
+    // Drag select: press on a cell starts the rect; moving while held
+    // extends it; release finalizes.
+    if resp.is_pointer_button_down_on() {
+        match file.drag_select {
+            None => {
+                file.drag_select = Some(crate::app::Cell { rowid, col });
+                if !ui.input(|i| i.modifiers.shift) {
+                    file.selection = Some(crate::app::Sel::single(rowid, col));
+                }
+            }
+            Some(d) if d.rowid != rowid || d.col != col => {
+                if let Some(sel) = file.selection.as_mut() {
+                    sel.head = crate::app::Cell { rowid, col };
+                }
+                file.drag_select = Some(crate::app::Cell { rowid, col });
+            }
+            _ => {}
+        }
     }
 
     if resp.clicked() {
@@ -322,14 +416,16 @@ fn draw_cell(ui: &mut Ui, file: &mut crate::app::FileState, rowid: u64, col: usi
         {
             file.commit_editing();
         }
-        file.selection = Some(crate::app::Sel { rowid, col });
+        // Drag selection already produced the final rect while the button
+        // was down; a plain press collapsed it to one cell at press time.
+        file.drag_select = None;
     }
     if resp.double_clicked() {
-        file.selection = Some(crate::app::Sel { rowid, col });
+        file.selection = Some(crate::app::Sel::single(rowid, col));
         file.begin_edit_at(rowid, col);
     }
     if resp.secondary_clicked() {
-        file.selection = Some(crate::app::Sel { rowid, col });
+        file.selection = Some(crate::app::Sel::single(rowid, col));
     }
     resp.context_menu(|ui| {
         let value_text = file

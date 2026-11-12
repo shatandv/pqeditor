@@ -127,10 +127,7 @@ pub struct Cell {
     pub col: usize,
 }
 
-/// Rectangular selection: everything between `anchor` and `head`
-/// (inclusive). A single selected cell has anchor == head; clicking a row
-/// number selects a full-width rect; selecting a column selects a
-/// full-height one.
+/// Everything between `anchor` and `head` inclusive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Sel {
     pub anchor: Cell,
@@ -141,6 +138,14 @@ impl Sel {
     pub fn single(rowid: u64, col: usize) -> Self {
         let c = Cell { rowid, col };
         Self { anchor: c, head: c }
+    }
+
+    /// One row across every column (row-number click).
+    pub fn single_full_row(rowid: u64, ncols: usize) -> Self {
+        Self {
+            anchor: Cell { rowid, col: 0 },
+            head: Cell { rowid, col: ncols.saturating_sub(1) },
+        }
     }
 
     /// The selected rectangle as (first_row, last_row, first_col, last_col),
@@ -304,11 +309,6 @@ impl GridState {
                 EditValue::Text(t) => t.clone(),
             });
         }
-        self.cell(rowid, col).map(|c| c.value.display())
-    }
-
-    /// Cell text for copy-to-clipboard (overlay applied).
-    pub fn copy_text(&mut self, rowid: u64, col: usize) -> Option<String> {
         self.cell(rowid, col).map(|c| c.value.display())
     }
 

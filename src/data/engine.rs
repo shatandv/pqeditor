@@ -200,11 +200,9 @@ impl Worker {
             .with_context(|| format!("cannot read parquet file: {}", path.display()))?;
 
         self.seq += 1;
-        self.conn.execute_batch(&format!(
-            "CREATE OR REPLACE VIEW {} AS SELECT row_number() OVER () - 1 AS __rowid, * FROM read_parquet({})",
-            self.view_name(),
-            sql_quote(&p),
-        ))?;
+        self.path = Some(path);
+        self.deleted_rows.clear();
+        self.recreate_view()?;
 
         let mut stmt = self.conn.prepare(&format!(
             "DESCRIBE SELECT * EXCLUDE (__rowid) FROM {}",
@@ -223,9 +221,6 @@ impl Worker {
             bail!("parquet file has no columns");
         }
         self.schema = schema;
-        self.path = Some(path);
-        self.deleted_rows.clear();
-        self.recreate_view()?;
         Ok((self.schema.clone(), total as u64))
     }
 
@@ -238,7 +233,7 @@ impl Worker {
             .map(|p| path_string(p))
             .ok_or_else(|| anyhow!("no file open"))?;
         let mut sql = format!(
-            "CREATE OR REPLACE VIEW {} AS SELECT row_number() OVER () - 1 AS __rowid, * FROM read_parquet({})",
+            "CREATE OR REPLACE VIEW {} AS SELECT * FROM (SELECT row_number() OVER () - 1 AS __rowid, * FROM read_parquet({}))",
             self.view_name(),
             sql_quote(&p),
         );
@@ -815,6 +810,13 @@ fn worker_loop(
                 Ok((schema, total)) => JobResult::Opened { schema, total },
                 Err(e) => JobResult::Failed { source: FailSource::General, message: short_error(e) },
             },
+            Job::SetDeletedRows { rows } => {
+                worker.deleted_rows = rows;
+                match worker.recreate_view() {
+                    Ok(()) => continue, // no answer needed; UI requeries itself
+                    Err(e) => JobResult::Failed { source: FailSource::General, message: short_error(e) },
+                }
+            }
             Job::Count { epoch, filter } => match worker.count(filter.as_deref()) {
                 Ok(total) => JobResult::Count { epoch, total },
                 Err(e) => JobResult::Failed { source: FailSource::Filter, message: short_error(e) },
@@ -833,10 +835,12 @@ fn worker_loop(
                 Ok((values, truncated)) => JobResult::TopValues { col, values, truncated },
                 Err(e) => JobResult::Failed { source: FailSource::General, message: short_error(e) },
             },
-            Job::Save { overlay, progress } => match worker.save(&overlay, &progress) {
-                Ok(message) => JobResult::Done { kind: JobKind::Save, message },
-                Err(e) => JobResult::Failed { source: FailSource::General, message: short_error(e) },
-            },
+            Job::Save { overlay, drop_cols, progress } => {
+                match worker.save(&overlay, &drop_cols, &progress) {
+                    Ok(message) => JobResult::Done { kind: JobKind::Save, message },
+                    Err(e) => JobResult::Failed { source: FailSource::General, message: short_error(e) },
+                }
+            }
             Job::Export { path, filter, format, delimiter, progress } => {
                 match worker.export(&path, filter.as_deref(), format, delimiter, &progress) {
                     Ok(message) => JobResult::Done { kind: JobKind::Export, message },
@@ -1029,7 +1033,7 @@ mod integration_tests {
             (5, 1, EditValue::Text("99.5".into())),
         ];
         let (tx, _rx) = mpsc::channel::<String>();
-        app.engine.send(Job::Save { overlay, progress: tx });
+        app.engine.send(Job::Save { overlay, drop_cols: vec![], progress: tx });
         match recv(&app.engine) {
             JobResult::Done { kind: JobKind::Save, message } => {
                 assert!(message.contains("saved"));
@@ -1149,3 +1153,107 @@ mod integration_tests {
     }
 }
 
+
+#[cfg(test)]
+mod deletion_tests {
+    //! User-deleted rows / dropped columns survive the save round trip.
+
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    fn tmp(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "pqeditor-del-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn make_parquet(path: &std::path::Path, rows: i64) {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "COPY (SELECT i AS id, 'row_' || i AS label FROM range({rows}) t(i)) TO {}",
+            crate::data::types::sql_quote(&path.to_string_lossy()),
+        ))
+        .unwrap();
+    }
+
+    fn recv(engine: &Engine) -> JobResult {
+        engine
+            .results
+            .recv_timeout(Duration::from_secs(30))
+            .expect("worker answered")
+    }
+
+    #[test]
+    fn deleted_rows_excluded_from_count_and_save() {
+        let dir = tmp("del-rows");
+        let path = dir.join("t.parquet");
+        make_parquet(&path, 100);
+        let engine = Engine::spawn().unwrap();
+        engine.send(Job::Open { path: path.clone() });
+        assert!(matches!(recv(&engine), JobResult::Opened { .. }));
+
+        engine.send(Job::SetDeletedRows { rows: vec![0, 1, 2] });
+
+        // The count must reflect the view (97 rows).
+        engine.send(Job::Count { epoch: 0, filter: None });
+        match recv(&engine) {
+            JobResult::Count { total, .. } => assert_eq!(total, 97),
+            other => panic!("expected Count, got {other:?}"),
+        }
+
+        // Save: the file on disk must lose the three rows.
+        let (tx, _rx) = mpsc::channel::<String>();
+        engine.send(Job::Save { overlay: vec![], drop_cols: vec![], progress: tx });
+        assert!(matches!(recv(&engine), JobResult::Done { kind: JobKind::Save, .. }));
+
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let n: i64 = conn
+            .query_row(
+                &format!("SELECT count(*) FROM read_parquet({})", crate::data::types::sql_quote(&path.to_string_lossy())),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 97);
+    }
+
+    #[test]
+    fn dropped_column_excluded_from_save() {
+        let dir = tmp("drop-col");
+        let path = dir.join("t.parquet");
+        make_parquet(&path, 10);
+        let engine = Engine::spawn().unwrap();
+        engine.send(Job::Open { path: path.clone() });
+        assert!(matches!(recv(&engine), JobResult::Opened { .. }));
+
+        let (tx, _rx) = mpsc::channel::<String>();
+        engine.send(Job::Save { overlay: vec![], drop_cols: vec![1], progress: tx });
+        assert!(matches!(recv(&engine), JobResult::Done { kind: JobKind::Save, .. }));
+
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let cols: i64 = conn
+            .query_row(
+                &format!("SELECT count(*) FROM (DESCRIBE SELECT * FROM read_parquet({}))", crate::data::types::sql_quote(&path.to_string_lossy())),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cols, 1);
+        let n: i64 = conn
+            .query_row(
+                &format!("SELECT count(*) FROM read_parquet({})", crate::data::types::sql_quote(&path.to_string_lossy())),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 10);
+    }
+}

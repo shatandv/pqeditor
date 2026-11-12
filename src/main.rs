@@ -200,6 +200,7 @@ impl app::App {
         }
 
         // Selection navigation (no borrow held while acting).
+        let shift = ctx.input(|i| i.modifiers.shift);
         let (up, down, left, right) = ctx.input(|i| {
             (
                 i.key_pressed(Key::ArrowUp),
@@ -212,21 +213,21 @@ impl app::App {
             ctx.input(|i| (i.key_pressed(Key::PageUp), i.key_pressed(Key::PageDown)));
         let (home, end) = ctx.input(|i| (i.key_pressed(Key::Home), i.key_pressed(Key::End)));
         if up {
-            self.move_selection(-1, 0);
+            self.move_selection(-1, 0, shift);
         } else if down {
-            self.move_selection(1, 0);
+            self.move_selection(1, 0, shift);
         } else if left {
-            self.move_selection(0, -1);
+            self.move_selection(0, -1, shift);
         } else if right {
-            self.move_selection(0, 1);
+            self.move_selection(0, 1, shift);
         } else if page_up {
-            self.move_selection(-20, 0);
+            self.move_selection(-20, 0, shift);
         } else if page_down {
-            self.move_selection(20, 0);
+            self.move_selection(20, 0, shift);
         } else if home {
-            self.move_selection(i64::MIN / 2, 0);
+            self.move_selection(i64::MIN / 2, 0, shift);
         } else if end {
-            self.move_selection(i64::MAX / 2, 0);
+            self.move_selection(i64::MAX / 2, 0, shift);
         }
 
         let (f2, enter, del, c) = ctx.input(|i| {
@@ -239,10 +240,33 @@ impl app::App {
         });
         if f2 || enter {
             self.begin_edit();
+        } else if del && !ctrl {
+            // Whole-row selection: delete the rows. Cell selection: clear
+            // the selected cells to NULL.
+            let whole_rows = self
+                .file
+                .as_ref()
+                .and_then(|f| f.selection.as_ref())
+                .is_some_and(|s| s.is_whole_rows(self.file.as_ref().unwrap().grid.schema.len()));
+            if whole_rows {
+                self.delete_selected_rows();
+            } else {
+                self.set_cell_null();
+            }
         } else if ctrl && del {
             self.set_cell_null();
         } else if ctrl && c {
             self.copy_selection(&ctx);
+        } else if ctrl && ctx.input(|i| i.key_pressed(Key::V)) {
+            // egui delivers clipboard text as a Paste event.
+            if let Some(text) = ctx.input(|i| {
+                i.raw.events.iter().find_map(|e| match e {
+                    egui::Event::Paste(t) => Some(t.clone()),
+                    _ => None,
+                })
+            }) {
+                self.paste_tsv(&text);
+            }
         }
 
         let esc = ctx.input(|i| i.key_pressed(Key::Escape));
@@ -267,7 +291,7 @@ impl app::App {
     fn copy_selection(&mut self, ctx: &egui::Context) {
         if let Some(f) = self.file.as_mut() {
             if let Some(sel) = f.selection {
-                if let Some(text) = f.grid.copy_text(sel.rowid, sel.col) {
+                if let Some(text) = f.grid.copy_rect(&sel, 1_000_000) {
                     ctx.copy_text(text);
                 }
             }

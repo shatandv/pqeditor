@@ -66,7 +66,11 @@ fn confirm_dialog(ctx: &egui::Context, app: &mut App) -> bool {
             if let Some(f) = app.file.as_mut() {
                 f.grid.overlay.clear();
                 f.editing = None;
+                f.selection = None;
             }
+            // Deleted rows were excluded from the view; restore it.
+            app.engine.send(crate::data::engine::Job::SetDeletedRows { rows: vec![] });
+            app.refresh_count();
             match confirm {
                 crate::app::Confirm::OpenFile => {
                     app.confirm = None;
@@ -376,7 +380,7 @@ fn goto_row_dialog(ctx: &egui::Context, app: &mut App) -> bool {
     if let Some(row) = go {
         let row = row.min(total.saturating_sub(1));
         if let Some(f) = app.file.as_mut() {
-            f.selection = Some(crate::app::Sel { rowid: row, col: 0 });
+            f.selection = Some(crate::app::Sel::single(row, 0));
             f.scroll_to_row = Some(row);
             f.goto_row = None;
         }

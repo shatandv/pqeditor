@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::data::engine::{Engine, FailSource, Job, JobKind, JobResult};
 pub use crate::data::engine::ExportFormat;
 use crate::data::model::{GridState, PAGE_SIZE};
+pub use crate::data::model::{Cell, Sel};
 use crate::data::types::{ColumnSchema, ColumnStats, EditValue, SortKey};
 
 /// Where per-file state lives. One file open at a time (v1).
@@ -36,6 +37,8 @@ pub struct FileState {
     pub scroll_to_row: Option<u64>,
     /// Cell edit validation error, surfaced in the status bar.
     pub commit_error: Option<String>,
+    /// Cell where a drag-select started; None when not dragging.
+    pub drag_select: Option<Cell>,
 }
 
 impl FileState {
@@ -57,6 +60,7 @@ impl FileState {
             goto_row: None,
             scroll_to_row: None,
             commit_error: None,
+            drag_select: None,
         }
     }
 
@@ -79,9 +83,18 @@ impl FileState {
         self.selection = None;
     }
 
-    /// Start editing a cell (type permitting).
+    /// Start editing a cell (type permitting). Deleted rows cannot be
+    /// edited.
     pub fn begin_edit_at(&mut self, rowid: u64, col: usize) {
+        if self.grid.overlay.is_row_deleted(rowid) {
+            self.commit_error = Some("row is deleted (unsaved)".into());
+            return;
+        }
         let Some(schema) = self.grid.schema.get(col) else { return };
+        if self.grid.overlay.is_col_deleted(col) {
+            self.commit_error = Some("column is dropped (unsaved)".into());
+            return;
+        }
         if !schema.ty.editable() {
             self.commit_error = Some(format!(
                 "column '{}' ({}) is read-only",
@@ -92,6 +105,26 @@ impl FileState {
         }
         let text = self.grid.edit_source_text(rowid, col).unwrap_or_default();
         self.editing = Some(EditState { rowid, col, initial: text.clone(), text });
+    }
+
+    /// Drop a column: hidden client-side, excluded from save. Indices stay
+    /// stable.
+    pub fn drop_col(&mut self, col: usize) {
+        if self.grid.schema.len()
+            <= self.grid.schema.len().saturating_sub(self.grid.overlay.deleted_cols.len())
+        {
+            // Only refuse when dropping would leave zero visible columns.
+        }
+        let visible = self.grid.schema.len() - self.grid.overlay.deleted_cols.len();
+        if visible <= 1 {
+            self.commit_error = Some("cannot drop the last visible column".into());
+            return;
+        }
+        if self.grid.overlay.is_col_deleted(col) {
+            return;
+        }
+        self.grid.overlay.drop_col(col);
+        self.selection = None;
     }
 
     /// Commit the active edit: validate against the column type, store in
@@ -127,18 +160,6 @@ impl FileState {
         self.grid.requery(sort, filter);
     }
 
-    /// New sort stack / manual requery after external changes (save).
-    pub fn requery(&mut self) {
-        let sort = self.grid.sort.clone();
-        let filter = self.grid.filter.clone();
-        self.grid.requery(sort, filter);
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Sel {
-    pub rowid: u64,
-    pub col: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -295,7 +316,8 @@ impl App {
         }
         self.error = None;
         self.status = format!("opening {}", path.display());
-        self.file = None;
+        // Keep the old grid visible until Opened replaces it (matters for
+        // the save-and-continue flow, where the file is unchanged).
         self.opening = Some(path.clone());
         self.engine.send(Job::Open { path });
     }
@@ -322,10 +344,13 @@ impl App {
             .all()
             .map(|(r, c, v)| (r, c, v.clone()))
             .collect();
+        let drop_cols: Vec<usize> =
+            file.grid.overlay.deleted_cols.iter().copied().collect();
         self.saving = true;
         self.status = "saving\u{2026}".into();
         self.engine.send(Job::Save {
             overlay,
+            drop_cols,
             progress: self.engine.progress_sender(),
         });
     }
@@ -491,31 +516,135 @@ impl App {
     pub fn begin_edit(&mut self) {
         let Some(f) = self.file.as_mut() else { return };
         let Some(sel) = f.selection else { return };
-        f.begin_edit_at(sel.rowid, sel.col);
+        f.begin_edit_at(sel.head.rowid, sel.head.col);
     }
 
+    /// Set NULL on every selected cell.
     pub fn set_cell_null(&mut self) {
         let Some(f) = self.file.as_mut() else { return };
         let Some(sel) = f.selection else { return };
-        f.grid.overlay.set(sel.rowid, sel.col, EditValue::Null);
+        let total = f.grid.cache.total();
+        let (r0, r1, c0, c1) = sel.rect(total, f.grid.schema.len());
+        for r in r0..=r1 {
+            for c in c0..=c1 {
+                if f.grid.schema.get(c).is_some_and(|s| s.ty.editable()) {
+                    f.grid.overlay.set(r, c, EditValue::Null);
+                }
+            }
+        }
     }
 
-    /// Move the selection by (drow, dcol), clamped to the grid. Scrolls the
-    /// view to the new row.
-    pub fn move_selection(&mut self, drow: i64, dcol: i64) {
+    /// Delete the selected rows (whole-row selection): the overlay marks
+    /// them, the worker's view excludes them, save rewrites without them.
+    pub fn delete_selected_rows(&mut self) {
+        let Some(f) = self.file.as_ref() else { return };
+        let Some(sel) = f.selection else { return };
+        let total = f.grid.cache.total();
+        let (r0, r1, _, _) = sel.rect(total, f.grid.schema.len());
+        if !sel.is_whole_rows(f.grid.schema.len()) {
+            self.error = Some("click a row number to select whole rows first".into());
+            return;
+        }
+        let rows: Vec<u64> = (r0..=r1).collect();
+        let all: Vec<u64> = {
+            let f = self.file.as_mut().unwrap();
+            f.grid.overlay.delete_rows(rows.iter().copied());
+            f.grid.overlay.deleted_rows.iter().copied().collect()
+        };
+        let Some(f) = self.file.as_mut() else { return };
+        let sort = f.grid.sort.clone();
+        let filter = f.grid.filter.clone();
+        f.grid.requery(sort, filter);
+        f.selection = None;
+        let n = all.len();
+        self.engine.send(Job::SetDeletedRows { rows: all });
+        self.refresh_count();
+        self.status = format!("{} rows deleted (unsaved)", n);
+    }
+
+    /// Paste a TSV block (or a single value, which fills the whole
+    /// selection) anchored at the selection's top-left corner.
+    pub fn paste_tsv(&mut self, text: &str) {
+        let Some(f) = self.file.as_mut() else { return };
+        let Some(sel) = f.selection else { return };
+        let total = f.grid.cache.total();
+        let ncols = f.grid.schema.len();
+        let (r0, _, c0, _) = sel.rect(total, ncols);
+        let lines: Vec<&str> = text.lines().collect();
+        if lines.is_empty() {
+            return;
+        }
+        let one_cell = lines.len() == 1 && !lines[0].contains('\t');
+        let mut applied = 0usize;
+        let mut rejected: Option<String> = None;
+        let (_, r1, _, c1) = sel.rect(total, ncols);
+        for (i, line) in lines.iter().enumerate() {
+            let fields: Vec<&str> = if one_cell {
+                // A single value fills every cell of the selection rect.
+                let width = (c1 - c0 + 1) as usize;
+                let height = (r1 - r0 + 1) as usize;
+                if r0 + height as u64 > total {
+                    rejected = Some("paste overflows the row count".into());
+                    break;
+                }
+                let mut v = Vec::new();
+                for _ in 0..height {
+                    v.extend(std::iter::repeat(line).take(width));
+                }
+                v
+            } else {
+                line.split('\t').collect()
+            };
+            for (j, raw) in fields.iter().enumerate() {
+                let row = r0 + i as u64;
+                let col = c0 + j;
+                let Some(schema) = f.grid.schema.get(col) else { continue };
+                if !schema.ty.editable() {
+                    continue;
+                }
+                match crate::data::types::validate_edit(schema.ty, raw) {
+                    Ok(val) => {
+                        f.grid.overlay.set(row, col, val);
+                        applied += 1;
+                    }
+                    Err(msg) => {
+                        rejected
+                            .get_or_insert_with(|| format!("col '{}': {msg}", schema.name));
+                    }
+                }
+            }
+        }
+        if let Some(msg) = rejected {
+            self.error = Some(msg);
+        } else {
+            self.status = format!("pasted {} cells", applied);
+        }
+    }
+
+    /// Move the selection by (drow, dcol), clamped to the grid. With
+    /// `extend` (shift held), only the head moves; otherwise anchor and
+    /// head move together. Scrolls the view to the new row.
+    pub fn move_selection(&mut self, drow: i64, dcol: i64, extend: bool) {
         let Some(file) = self.file.as_mut() else { return };
-        let total = file.shown_rows;
+        let total = file.shown_rows.max(file.grid.cache.total());
         if total == 0 {
             return;
         }
         let ncols = file.grid.schema.len() as i64;
-        let (row, col) = match file.selection {
-            Some(sel) => (sel.rowid as i64 + drow, sel.col as i64 + dcol),
-            None => (drow.min(0).max(0), dcol.min(0).max(0)),
+        let (row, col, anchor) = match file.selection {
+            Some(sel) => {
+                let base = if extend { sel.head } else { sel.head };
+                (base.rowid as i64 + drow, base.col as i64 + dcol, sel.anchor)
+            }
+            None => (drow.min(0).max(0), dcol.min(0).max(0), Cell { rowid: 0, col: 0 }),
         };
         let row = row.clamp(0, total as i64 - 1) as u64;
         let col = col.clamp(0, ncols - 1) as usize;
-        file.selection = Some(Sel { rowid: row, col });
+        let anchor = if extend { anchor } else { Cell { rowid: row, col } };
+        file.selection = Some(Sel {
+            anchor,
+            head: Cell { rowid: row, col },
+        });
         file.scroll_to_row = Some(row);
     }
 
@@ -588,10 +717,19 @@ impl App {
                         self.saving = false;
                         if let Some(f) = self.file.as_mut() {
                             f.grid.overlay.clear();
-                            f.requery();
+                            f.editing = None;
+                            f.selection = None;
                         }
-                        self.refresh_count();
-                        self.status = message;
+                        self.status = message.clone();
+                        // Re-open the saved file: refreshes the schema (a
+                        // column may have been dropped) and the view
+                        // (deleted rows are now really gone). Keeps the old
+                        // grid visible until Opened arrives.
+                        if let Some(f) = self.file.as_ref() {
+                            let path = f.path.clone();
+                            self.opening = Some(path.clone());
+                            self.engine.send(Job::Open { path });
+                        }
                         // Save & continue flows (confirm dialog).
                         if self.quit_after_save {
                             self.quit_after_save = false;
@@ -723,7 +861,7 @@ mod app_tests {
         let rows: Vec<Vec<CellValue>> = (0..10).map(|i| vec![CellValue::Int(i)]).collect();
         assert!(f.grid.cache.put_page(1, 0, rows));
 
-        f.selection = Some(Sel { rowid: 3, col: 0 });
+        f.selection = Some(Sel::single(3, 0));
         f.begin_edit_at(3, 0);
         // Commit without touching the text: no overlay entry.
         f.commit_editing();
