@@ -33,7 +33,12 @@ pub struct FileState {
     /// Go-to-row dialog state: `None` = closed, `Some(draft)` = open.
     pub goto_row: Option<String>,
     /// Row to scroll to on the next grid draw (keyboard navigation).
-    pub scroll_to_row: Option<u64>,
+    /// Scroll request for the table: jump-center (PageUp/Down/Home/End,
+    /// goto-row) or a minimal edge scroll (arrow keys: only when the moved
+    /// cell left the visible area, Excel-style).
+    pub scroll_to_row: Option<ScrollRequest>,
+    /// The row-position range rendered last frame (from the grid draw).
+    pub visible_rows: Option<(u64, u64)>,
     /// Cell edit validation error, surfaced in the status bar.
     pub commit_error: Option<String>,
     /// Cell where a drag-select started; None when not dragging.
@@ -57,6 +62,7 @@ impl FileState {
             export_dialog: None,
             goto_row: None,
             scroll_to_row: None,
+            visible_rows: None,
             commit_error: None,
             drag_select: None,
         }
@@ -144,6 +150,78 @@ impl FileState {
         });
     }
 
+    // ---- interaction state machine ---------------------------------------
+    // The grid draw closures call these; headless tests drive them directly,
+    // which keeps the click/drag behavior deterministic and unit-tested.
+
+    /// Primary button is down over a cell: starts a drag-select (collapsing
+    /// the selection to this cell) or extends the rect while dragging.
+    pub fn pointer_on_cell(&mut self, pos: u64, col: usize, shift: bool) {
+        match self.drag_select {
+            None => {
+                self.drag_select = Some(Cell { pos, col });
+                if !shift {
+                    self.selection = Some(Sel::single(pos, col));
+                }
+            }
+            Some(d) if d.pos != pos || d.col != col => {
+                if let Some(sel) = self.selection.as_mut() {
+                    sel.head = Cell { pos, col };
+                }
+                self.drag_select = Some(Cell { pos, col });
+            }
+            _ => {}
+        }
+    }
+
+    /// Primary button released: a drag-select ends. A drag's release never
+    /// lands as `clicked()` on the release cell (the press started
+    /// elsewhere), so this must run on any release frame.
+    pub fn pointer_release(&mut self) {
+        self.drag_select = None;
+    }
+
+    /// Plain click on a cell: an open editor on another cell commits
+    /// (click-away = commit, like Excel).
+    pub fn click_cell(&mut self, pos: u64, col: usize) {
+        if self
+            .editing
+            .as_ref()
+            .is_some_and(|e| e.pos != pos || e.col != col)
+        {
+            self.commit_editing();
+        }
+        self.drag_select = None;
+    }
+
+    /// Double-click on a cell opens the editor.
+    pub fn double_click_cell(&mut self, pos: u64, col: usize) {
+        self.selection = Some(Sel::single(pos, col));
+        self.begin_edit_at(pos, col);
+    }
+
+    /// Right-click on a cell selects it (the context menu follows).
+    pub fn secondary_click_cell(&mut self, pos: u64, col: usize) {
+        self.selection = Some(Sel::single(pos, col));
+    }
+
+    /// Row-number click: select the whole row; shift extends the current
+    /// row selection to this row.
+    pub fn click_rownum(&mut self, pos: u64, shift: bool) {
+        if self.editing.is_some() {
+            self.commit_editing();
+        }
+        let ncols = self.grid.schema.len();
+        if !shift {
+            self.selection = Some(Sel::single_full_row(pos, ncols));
+        } else if let Some(sel) = self.selection.as_mut() {
+            sel.head = Cell {
+                pos,
+                col: ncols.saturating_sub(1),
+            };
+        }
+    }
+
     /// Drop a column: hidden client-side, excluded from save. Indices stay
     /// stable.
     pub fn drop_col(&mut self, col: usize) {
@@ -202,6 +280,18 @@ impl FileState {
         let sort = self.grid.sort.clone();
         self.grid.requery(sort, filter);
     }
+}
+
+/// Scroll request for the table: jump-center (PageUp/Down/Home/End,
+/// goto-row) or a minimal edge scroll (arrow keys move one row only when
+/// the selection left the visible area, Excel-style).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollRequest {
+    /// Put the row at the vertical center of the view.
+    Center(u64),
+    /// Scroll minimally so the row is visible: aligned to the top edge
+    /// when scrolling up, bottom edge when scrolling down.
+    Edge(u64, bool),
 }
 
 #[derive(Debug, Clone)]
@@ -271,6 +361,12 @@ pub struct App {
     pub file: Option<FileState>,
     /// Path whose Open job is in flight.
     pub opening: Option<PathBuf>,
+    /// Sort/filter to restore on the next Opened (save-with-drops re-open
+    /// carries the view over).
+    pub reopen_carry: Option<(Vec<SortKey>, Option<String>)>,
+    /// Edits sent with the in-flight save; Done{Save} patches the fetched
+    /// pages with them so the display matches the file without a refetch.
+    pub last_saved_edits: Option<Vec<(u64, usize, EditValue)>>,
     /// File to open after the user resolves the unsaved-edits confirm.
     pub pending_open: Option<PathBuf>,
     /// Active unsaved-changes confirmation, if any.
@@ -321,6 +417,8 @@ impl App {
             engine,
             file: None,
             opening: None,
+            reopen_carry: None,
+            last_saved_edits: None,
             pending_open: None,
             confirm: None,
             quit_after_save: false,
@@ -400,6 +498,9 @@ impl App {
         let drop_cols: Vec<usize> = file.grid.overlay.deleted_cols.iter().copied().collect();
         self.saving = true;
         self.status = "saving\u{2026}".into();
+        // Kept so Done{Save} can patch the fetched pages in place (no
+        // flicker, display matches the saved file immediately).
+        self.last_saved_edits = Some(overlay.clone());
         self.engine.send(Job::Save {
             overlay,
             drop_cols,
@@ -650,29 +751,28 @@ impl App {
 
     /// Paste a TSV block (or a single value, which fills the whole
     /// selection) anchored at the selection's top-left corner.
+    /// All-or-nothing: every field is validated BEFORE anything is
+    /// applied, so a type error never leaves a half-applied paste.
     pub fn paste_tsv(&mut self, text: &str) {
         let Some(f) = self.file.as_mut() else { return };
         let Some(sel) = f.selection else { return };
         let total = f.grid.cache.total();
         let ncols = f.grid.schema.len();
-        let (r0, _, c0, _) = sel.rect(total, ncols);
+        let (r0, r1, c0, c1) = sel.rect(total, ncols);
         let lines: Vec<&str> = text.lines().collect();
         if lines.is_empty() {
             return;
         }
         let one_cell = lines.len() == 1 && !lines[0].contains('\t');
-        let mut applied = 0usize;
+        // Build the target cell list first (position, col, value). Nothing
+        // touches the overlay until every field validated.
+        let mut targets: Vec<(u64, usize, EditValue)> = Vec::new();
         let mut rejected: Option<String> = None;
-        let (_, r1, _, c1) = sel.rect(total, ncols);
         for (i, line) in lines.iter().enumerate() {
             let fields: Vec<&str> = if one_cell {
                 // A single value fills every cell of the selection rect.
                 let width = c1 - c0 + 1;
                 let height = (r1 - r0 + 1) as usize;
-                if r0 + height as u64 > total {
-                    rejected = Some("paste overflows the row count".into());
-                    break;
-                }
                 let mut v = Vec::new();
                 for _ in 0..height {
                     v.extend(std::iter::repeat_n(line, width));
@@ -684,6 +784,10 @@ impl App {
             for (j, raw) in fields.iter().enumerate() {
                 let pos = r0 + i as u64;
                 let col = c0 + j;
+                if pos >= total {
+                    rejected.get_or_insert_with(|| "paste overflows the row count".into());
+                    break;
+                }
                 let Some(rowid) = f.grid.rowid_at(pos) else {
                     rejected.get_or_insert_with(|| "row still loading".to_string());
                     continue;
@@ -695,10 +799,7 @@ impl App {
                     continue;
                 }
                 match crate::data::types::validate_edit(schema.ty, raw) {
-                    Ok(val) => {
-                        f.grid.overlay.set(rowid, col, val);
-                        applied += 1;
-                    }
+                    Ok(val) => targets.push((rowid, col, val)),
                     Err(msg) => {
                         rejected.get_or_insert_with(|| format!("col '{}': {msg}", schema.name));
                     }
@@ -707,9 +808,13 @@ impl App {
         }
         if let Some(msg) = rejected {
             self.error = Some(msg);
-        } else {
-            self.status = format!("pasted {} cells", applied);
+            return;
         }
+        let applied = targets.len();
+        for (rowid, col, val) in targets {
+            f.grid.overlay.set(rowid, col, val);
+        }
+        self.status = format!("pasted {} cells", applied);
     }
 
     /// Move the selection by (drow, dcol), clamped to the grid. With
@@ -729,7 +834,9 @@ impl App {
                 let base = sel.head;
                 (base.pos as i64 + drow, base.col as i64 + dcol, sel.anchor)
             }
-            None => (0, 0, Cell { pos: 0, col: 0 }),
+            // No selection yet: the step targets the destination directly
+            // (End/Down jump from the top, Left/Right clamp to col 0).
+            None => (drow.max(0), dcol.max(0), Cell { pos: 0, col: 0 }),
         };
         let row = row.clamp(0, total as i64 - 1) as u64;
         let col = col.clamp(0, ncols - 1) as usize;
@@ -742,7 +849,18 @@ impl App {
             anchor,
             head: Cell { pos: row, col },
         });
-        file.scroll_to_row = Some(row);
+        // Excel-style: single steps scroll only when the cell left the
+        // visible area (one-row motion); jumps (PageUp/Down/Home/End)
+        // center the row.
+        if drow.abs() > 2 {
+            file.scroll_to_row = Some(ScrollRequest::Center(row));
+        } else if let Some((lo, hi)) = file.visible_rows {
+            if row < lo {
+                file.scroll_to_row = Some(ScrollRequest::Edge(row, false));
+            } else if row > hi {
+                file.scroll_to_row = Some(ScrollRequest::Edge(row, true));
+            }
+        }
     }
 
     // ---- polling ---------------------------------------------------------
@@ -762,6 +880,11 @@ impl App {
                     // The grid renders from the cache's total; seed it with
                     // the real row count right away.
                     file.grid.cache.set_total(total);
+                    // A save-with-drops re-open carries the view over so
+                    // the grid doesn't jump back to unsorted file order.
+                    if let Some((sort, filter)) = self.reopen_carry.take() {
+                        file.grid.requery(sort, filter);
+                    }
                     self.file = Some(file);
                     self.push_recent();
                 }
@@ -813,20 +936,51 @@ impl App {
                 JobResult::Done { kind, message } => match kind {
                     JobKind::Save => {
                         self.saving = false;
+                        // Whether the schema changed (columns dropped):
+                        // only then does the file need re-opening.
+                        let dropped_cols = self
+                            .file
+                            .as_ref()
+                            .is_some_and(|f| !f.grid.overlay.deleted_cols.is_empty());
+                        let had_deleted_rows = self
+                            .file
+                            .as_ref()
+                            .is_some_and(|f| !f.grid.overlay.deleted_rows.is_empty());
                         if let Some(f) = self.file.as_mut() {
                             f.grid.overlay.clear();
                             f.editing = None;
-                            f.selection = None;
+                            // Keep the selection, sort and fetched pages:
+                            // a plain save does not change what the grid
+                            // shows (dropped columns were already hidden).
                         }
                         self.status = message.clone();
-                        // Re-open the saved file: refreshes the schema (a
-                        // column may have been dropped) and the view
-                        // (deleted rows are now really gone). Keeps the old
-                        // grid visible until Opened arrives.
-                        if let Some(f) = self.file.as_ref() {
-                            let path = f.path.clone();
-                            self.opening = Some(path.clone());
-                            self.engine.send(Job::Open { path });
+                        if had_deleted_rows {
+                            // The saved file no longer contains those rows;
+                            // clear the worker's view filter. Rowids of the
+                            // surviving rows are unchanged, so the fetched
+                            // pages stay valid.
+                            self.engine.send(Job::SetDeletedRows { rows: vec![] });
+                        } else if !dropped_cols {
+                            // Plain save: write the saved values into the
+                            // fetched pages so the display matches the file
+                            // with zero flicker.
+                            let edits = self.last_saved_edits.take().unwrap_or_default();
+                            if let Some(f) = self.file.as_mut() {
+                                f.grid.patch_saved_edits(&edits);
+                            }
+                        }
+                        if dropped_cols {
+                            // Re-open: the on-disk schema changed. Carry the
+                            // sort/filter over so the view survives.
+                            self.reopen_carry = self
+                                .file
+                                .as_ref()
+                                .map(|f| (f.grid.sort.clone(), f.grid.filter.clone()));
+                            if let Some(f) = self.file.as_ref() {
+                                let path = f.path.clone();
+                                self.opening = Some(path.clone());
+                                self.engine.send(Job::Open { path });
+                            }
                         }
                         // Save & continue flows (confirm dialog).
                         if self.quit_after_save {
@@ -924,6 +1078,80 @@ mod app_tests {
     }
 
     #[test]
+    fn paste_is_all_or_nothing() {
+        // A type error in ANY field must reject the whole paste: no
+        // half-applied block left in the overlay.
+        let dir = tmp("paste-atomic");
+        let path = dir.join("t.parquet");
+        make_parquet(&path, 10);
+        let app = &mut App::with_engine(Engine::spawn().unwrap(), Vec::new());
+        app.open_path(path);
+        drain(app);
+        let f = app.file.as_mut().unwrap();
+        f.grid.cache.clear(1, 10);
+        let rows: Vec<(u64, Vec<CellValue>)> = (0..10u64)
+            .map(|i| (i, vec![CellValue::Int(i as i64)]))
+            .collect();
+        assert!(f.grid.cache.put_page(1, 0, rows));
+
+        f.selection = Some(Sel::single(1, 0));
+        // 12 lines into a 10-row file starting at row 1 overflows.
+        app.paste_tsv("5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16");
+        let f = app.file.as_mut().unwrap();
+        assert!(app.error.is_some(), "overflow must be reported");
+        assert!(
+            f.grid.overlay.is_empty(),
+            "a rejected paste must not apply anything"
+        );
+    }
+
+    #[test]
+    fn save_keeps_view_state_when_no_schema_change() {
+        // A plain save (no drops) must NOT re-open the file: sort,
+        // selection and fetched pages survive, no flicker.
+        let dir = tmp("save-keep-state");
+        let path = dir.join("t.parquet");
+        make_parquet(&path, 100);
+        let app = &mut App::with_engine(Engine::spawn().unwrap(), Vec::new());
+        app.open_path(path.clone());
+        drain(app);
+        load_page0(app);
+
+        app.cycle_sort(0, false); // id ascending
+        load_page0(app);
+        let epoch_before = app.file.as_ref().unwrap().grid.cache.epoch();
+
+        let f = app.file.as_mut().unwrap();
+        f.selection = Some(Sel::single(3, 0));
+        app.begin_edit();
+        let f = app.file.as_mut().unwrap();
+        f.editing.as_mut().unwrap().text = "500".into();
+        f.commit_editing();
+        assert!(!f.grid.overlay.is_empty());
+
+        app.save();
+        wait_save(app);
+
+        let f = app.file.as_ref().unwrap();
+        assert_eq!(
+            f.grid.cache.epoch(),
+            epoch_before,
+            "plain save must not requery or re-open"
+        );
+        assert_eq!(f.grid.sort.len(), 1, "sort survives");
+        assert!(f.selection.is_some(), "selection survives");
+        assert!(f.grid.overlay.is_empty(), "edits applied");
+        assert!(
+            app.file.as_mut().unwrap().grid.cache.page(0).is_some(),
+            "pages stay valid across a plain save"
+        );
+        // The edited value is visible on the row that was edited.
+        let v = app.file.as_mut().unwrap().grid.cell(3, 0).unwrap();
+        assert_eq!(v.value, CellValue::Int(500));
+        assert_eq!(parquet_int_count(&path, "id = 500"), 1);
+    }
+
+    #[test]
     fn sort_and_filter_refresh_grid_row_count() {
         // Regression: cycle_sort/apply_popover requiered but never sent a
         // fresh count(*), so the grid rendered zero rows after any sort.
@@ -1009,7 +1237,10 @@ mod app_tests {
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
             app.poll();
+            // The optional post-save re-open (dropped columns) must also be
+            // finished, or state assertions race with the Opened reply.
             let done = !app.saving
+                && app.opening.is_none()
                 && app
                     .file
                     .as_ref()
@@ -1092,6 +1323,120 @@ mod app_tests {
                 ascending: false
             }]
         );
+    }
+
+    #[test]
+    fn drag_then_click_does_not_extend() {
+        // Regression (user-visible on the stale build): after a drag
+        // release, the NEXT plain click must select that single cell — not
+        // extend the old drag rect from the drag start to the click.
+        let dir = tmp("drag-click");
+        let path = dir.join("t.parquet");
+        make_parquet(&path, 10);
+        let app = &mut App::with_engine(Engine::spawn().unwrap(), Vec::new());
+        app.open_path(path);
+        drain(app);
+        let f = app.file.as_mut().unwrap();
+        f.grid.cache.clear(1, 10);
+        let rows: Vec<(u64, Vec<CellValue>)> = (0..10u64)
+            .map(|i| (i, vec![CellValue::Int(i as i64)]))
+            .collect();
+        assert!(f.grid.cache.put_page(1, 0, rows));
+
+        // Drag from (1,0) to (3,0): press, drag, release.
+        f.pointer_on_cell(1, 0, false);
+        f.pointer_on_cell(2, 0, false);
+        f.pointer_on_cell(3, 0, false);
+        assert_eq!(f.selection.unwrap().rect(10, 1).0, 1, "drag rect start");
+        assert_eq!(f.selection.unwrap().rect(10, 1).1, 3, "drag rect end");
+
+        f.pointer_release();
+        // A later click on another cell: press collapses to that cell,
+        // release ends the (non-)drag, the click finalizes.
+        f.pointer_on_cell(6, 0, false);
+        f.pointer_release();
+        f.click_cell(6, 0);
+        let sel = f.selection.unwrap();
+        assert_eq!(sel.anchor, sel.head, "plain click after drag = single cell");
+        assert_eq!(sel.head.pos, 6);
+    }
+
+    #[test]
+    fn click_away_commits_editor() {
+        // Clicking another cell commits an open editor (Excel behavior);
+        // clicking the edited cell does not.
+        let dir = tmp("click-away");
+        let path = dir.join("t.parquet");
+        make_parquet(&path, 10);
+        let app = &mut App::with_engine(Engine::spawn().unwrap(), Vec::new());
+        app.open_path(path);
+        drain(app);
+        let f = app.file.as_mut().unwrap();
+        f.grid.cache.clear(1, 10);
+        let rows: Vec<(u64, Vec<CellValue>)> = (0..10u64)
+            .map(|i| (i, vec![CellValue::Int(i as i64)]))
+            .collect();
+        assert!(f.grid.cache.put_page(1, 0, rows));
+
+        f.double_click_cell(2, 0);
+        assert!(f.editing.is_some(), "double-click opens the editor");
+        f.editing.as_mut().unwrap().text = "77".into();
+
+        // Click the SAME cell: editor stays.
+        f.click_cell(2, 0);
+        assert!(f.editing.is_some(), "click on edited cell keeps it open");
+
+        // Click another cell: commit lands in the overlay.
+        f.click_cell(5, 0);
+        assert!(f.editing.is_none(), "click-away commits");
+        assert!(!f.grid.overlay.is_empty(), "edited value stored");
+    }
+
+    #[test]
+    fn rownum_click_selects_row_and_shift_extends() {
+        let dir = tmp("rownum-select");
+        let path = dir.join("t.parquet");
+        make_parquet(&path, 10);
+        let app = &mut App::with_engine(Engine::spawn().unwrap(), Vec::new());
+        app.open_path(path);
+        drain(app);
+        let f = app.file.as_mut().unwrap();
+
+        f.click_rownum(2, false);
+        let sel = f.selection.unwrap();
+        assert_eq!(
+            sel.rect(10, 1),
+            (2, 2, 0, 0),
+            "row-number click selects the whole row"
+        );
+        assert!(sel.is_whole_rows(1), "counted as whole rows");
+
+        f.click_rownum(5, true);
+        let sel = f.selection.unwrap();
+        assert_eq!(sel.rect(10, 1), (2, 5, 0, 0), "shift extends the row rect");
+    }
+
+    #[test]
+    fn home_end_jump_without_selection() {
+        // End/Down with no selection must create a selection at the TARGET
+        // (previously the None arm anchored everything at row 0).
+        let dir = tmp("end-jump");
+        let path = dir.join("t.parquet");
+        make_parquet(&path, 100);
+        let app = &mut App::with_engine(Engine::spawn().unwrap(), Vec::new());
+        app.open_path(path);
+        drain(app);
+
+        app.move_selection(i64::MAX / 2, 0, false);
+        assert_eq!(
+            app.file.as_ref().unwrap().selection.unwrap().head.pos,
+            99,
+            "End with no selection jumps to the last row"
+        );
+
+        // And from a selection, End moves the head to the last row.
+        app.move_selection(i64::MAX / 2, 0, false);
+        assert_eq!(app.file.as_ref().unwrap().selection.unwrap().head.pos, 99);
     }
 
     #[test]

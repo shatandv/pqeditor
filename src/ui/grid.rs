@@ -12,7 +12,7 @@
 use egui::{Align, Color32, Key, Label, RichText, Sense, TextEdit, Ui};
 use egui_extras::{Column, TableBuilder};
 
-use crate::app::App;
+use crate::app::{App, ScrollRequest};
 use crate::data::engine::Job;
 use crate::data::model::PAGE_SIZE;
 use crate::data::types::{CellValue, ColType, SortKey};
@@ -52,7 +52,7 @@ pub fn draw(ui: &mut Ui, app: &mut App) {
     let schema = file.grid.schema.clone();
     let sort_state = file.grid.sort.clone();
     let filter_text = file.grid.filter.clone();
-    let scroll_to = file.scroll_to_row.take().map(|r| r as usize);
+    let scroll_to = file.scroll_to_row.take();
     let sel_rect = file.selection.map(|s| s.rect(total as u64, ncols));
     let sel_head = file.selection.map(|s| s.head);
 
@@ -75,6 +75,7 @@ pub fn draw(ui: &mut Ui, app: &mut App) {
                 .cell_layout(egui::Layout::left_to_right(Align::Center))
                 .column(Column::exact(ROWNUM_WIDTH))
                 .vscroll(true)
+                .animate_scrolling(false)
                 .auto_shrink([false, false]);
             for _ in 0..ncols_visible {
                 table = table.column(
@@ -84,7 +85,13 @@ pub fn draw(ui: &mut Ui, app: &mut App) {
                 );
             }
             let table = match scroll_to {
-                Some(idx) => table.scroll_to_row(idx, Some(Align::Center)),
+                Some(ScrollRequest::Center(idx)) => {
+                    table.scroll_to_row(idx as usize, Some(Align::Center))
+                }
+                Some(ScrollRequest::Edge(idx, down)) => table.scroll_to_row(
+                    idx as usize,
+                    Some(if down { Align::Max } else { Align::Min }),
+                ),
                 None => table,
             };
 
@@ -130,7 +137,7 @@ pub fn draw(ui: &mut Ui, app: &mut App) {
                         let row_selected =
                             sel_rect.is_some_and(|(r0, r1, _, _)| pos >= r0 && pos <= r1);
                         row.col(|ui| {
-                            draw_rownum_cell(ui, file, pos, row_selected, ncols);
+                            draw_rownum_cell(ui, file, pos, row_selected);
                         });
                         for &col in visible_cols.iter() {
                             row.col(|ui| {
@@ -140,6 +147,9 @@ pub fn draw(ui: &mut Ui, app: &mut App) {
                     });
                 });
         });
+
+    // Track the rendered row range for Excel-style edge scrolling.
+    file.visible_rows = seen.map(|(lo, hi)| (lo as u64, hi as u64));
 
     // Deferred header actions (needs &mut file, which the closures released).
     let mut sorted = false;
@@ -204,8 +214,8 @@ pub fn draw(ui: &mut Ui, app: &mut App) {
     // Any pointer release ends a drag-select. A drag's release never lands
     // as `clicked()` on the release cell (press started elsewhere), so the
     // per-cell path cannot clear it.
-    if file.drag_select.is_some() && ui.input(|i| i.pointer.any_released()) {
-        file.drag_select = None;
+    if ui.input(|i| i.pointer.any_released()) {
+        file.pointer_release();
     }
 
     // Request pages the visible rows need (plus one page ahead).
@@ -215,12 +225,16 @@ pub fn draw(ui: &mut Ui, app: &mut App) {
             .grid
             .cache
             .missing_pages(min_seen as u64, (max_seen + 1) as u64);
+        // Prefetch two pages ahead so fast scrolling rarely waits on the
+        // worker (blank-row chunks while a page is in flight).
         let ahead = ((max_seen + 1) as u64) / PAGE_SIZE as u64;
-        pages.extend(
-            file.grid
-                .cache
-                .missing_pages(ahead * PAGE_SIZE as u64, ahead * PAGE_SIZE as u64 + 1),
-        );
+        for next in [ahead, ahead + 1] {
+            pages.extend(
+                file.grid
+                    .cache
+                    .missing_pages(next * PAGE_SIZE as u64, next * PAGE_SIZE as u64 + 1),
+            );
+        }
         for page in pages {
             engine.send(Job::Rows {
                 epoch: file.grid.cache.epoch(),
@@ -321,13 +335,7 @@ fn draw_header_cell(
     });
 }
 
-fn draw_rownum_cell(
-    ui: &mut Ui,
-    file: &mut crate::app::FileState,
-    pos: u64,
-    selected: bool,
-    ncols: usize,
-) {
+fn draw_rownum_cell(ui: &mut Ui, file: &mut crate::app::FileState, pos: u64, selected: bool) {
     if selected {
         paint_row_bg(ui, theme::BG_SELECT);
     }
@@ -337,19 +345,9 @@ fn draw_rownum_cell(
         ui.scope_id().with(("pq-rownum", pos)),
         Sense::click(),
     );
-    if resp.clicked() && !ui.input(|i| i.modifiers.shift) {
-        if file.editing.is_some() {
-            file.commit_editing();
-        }
-        file.selection = Some(crate::app::Sel::single_full_row(pos, ncols));
-    } else if resp.clicked() {
-        // Shift+click extends the row selection.
-        if let Some(sel) = file.selection.as_mut() {
-            sel.head = crate::app::Cell {
-                pos,
-                col: ncols.saturating_sub(1),
-            };
-        }
+    if resp.clicked() {
+        let shift = ui.input(|i| i.modifiers.shift);
+        file.click_rownum(pos, shift);
     }
     // Show the row's true file rowid when the page is fetched (stable under
     // sort); fall back to the view position while loading.
@@ -457,44 +455,18 @@ fn draw_cell(
     // for the press-origin widget, which never extends.)
     let dragging = ui.input(|i| i.pointer.primary_down()) && ui.rect_contains_pointer(rect);
     if dragging {
-        match file.drag_select {
-            None => {
-                file.drag_select = Some(crate::app::Cell { pos, col });
-                if !ui.input(|i| i.modifiers.shift) {
-                    file.selection = Some(crate::app::Sel::single(pos, col));
-                }
-            }
-            Some(d) if d.pos != pos || d.col != col => {
-                if let Some(sel) = file.selection.as_mut() {
-                    sel.head = crate::app::Cell { pos, col };
-                }
-                file.drag_select = Some(crate::app::Cell { pos, col });
-            }
-            _ => {}
-        }
+        let shift = ui.input(|i| i.modifiers.shift);
+        file.pointer_on_cell(pos, col, shift);
     }
 
     if resp.clicked() {
-        // Clicking a different cell while an editor is open commits it
-        // (click-away = commit, like Excel).
-        if file.editing.is_some()
-            && !file
-                .editing
-                .as_ref()
-                .is_some_and(|e| e.pos == pos && e.col == col)
-        {
-            file.commit_editing();
-        }
-        // Drag selection already produced the final rect while the button
-        // was down; a plain press collapsed it to one cell at press time.
-        file.drag_select = None;
+        file.click_cell(pos, col);
     }
     if resp.double_clicked() {
-        file.selection = Some(crate::app::Sel::single(pos, col));
-        file.begin_edit_at(pos, col);
+        file.double_click_cell(pos, col);
     }
     if resp.secondary_clicked() {
-        file.selection = Some(crate::app::Sel::single(pos, col));
+        file.secondary_click_cell(pos, col);
     }
     resp.context_menu(|ui| {
         let value_text = file

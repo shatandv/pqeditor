@@ -270,6 +270,51 @@ impl GridState {
         self.shown_rows = 0;
     }
 
+    /// Write saved edits into the cached pages so the display matches the
+    /// file after a save without a refetch (no flicker). A plain save does
+    /// not change rowids, so the pages stay valid.
+    pub fn patch_saved_edits(&mut self, edits: &[(u64, usize, EditValue)]) {
+        if edits.is_empty() {
+            return;
+        }
+        let types: Vec<crate::data::types::ColType> = self.schema.iter().map(|s| s.ty).collect();
+        let convert = |ty: Option<crate::data::types::ColType>, ev: &EditValue| match ev {
+            EditValue::Null => CellValue::Null,
+            EditValue::Text(t) => match ty {
+                Some(crate::data::types::ColType::Integer) => t
+                    .parse::<i64>()
+                    .map(CellValue::Int)
+                    .unwrap_or_else(|_| CellValue::Text(t.clone())),
+                Some(crate::data::types::ColType::Float) => t
+                    .parse::<f64>()
+                    .map(CellValue::Float)
+                    .unwrap_or_else(|_| CellValue::Text(t.clone())),
+                _ => CellValue::Text(t.clone()),
+            },
+        };
+        let mut page_ids: Vec<u64> = self.cache.pages.keys().copied().collect();
+        page_ids.sort_unstable();
+        for page in page_ids {
+            let Some((_, Some(rows))) = self.cache.pages.get_mut(&page) else {
+                continue;
+            };
+            for (rowid, col, ev) in edits {
+                let ty = types.get(*col).copied();
+                let value = convert(ty, ev);
+                // Pages hold view positions; rowids are NOT sorted within a
+                // page under sort/filter, so scan linearly.
+                for (r, cells) in rows.iter_mut() {
+                    if *r == *rowid {
+                        if let Some(cell) = cells.get_mut(*col) {
+                            *cell = value;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
     /// A cell as the grid should show it: overlay first, cached value second.
     /// `pos` is the view position; the returned `rowid` is the row's true
     /// file rowid. Returns None while the row is not fetched yet (grid

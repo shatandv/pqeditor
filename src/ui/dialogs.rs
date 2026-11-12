@@ -402,7 +402,7 @@ fn goto_row_dialog(ctx: &egui::Context, app: &mut App) -> bool {
         let row = row.min(total.saturating_sub(1));
         if let Some(f) = app.file.as_mut() {
             f.selection = Some(crate::app::Sel::single(row, 0));
-            f.scroll_to_row = Some(row);
+            f.scroll_to_row = Some(crate::app::ScrollRequest::Center(row));
             f.goto_row = None;
         }
         return false;

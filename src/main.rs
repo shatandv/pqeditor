@@ -28,12 +28,14 @@ use egui::Key;
 pub const STORAGE_KEY: &str = "pqeditor/recents";
 
 fn main() {
+    install_panic_log();
+
     // Optional CLI: open a parquet file at startup.
     let open_path = std::env::args().nth(1).map(std::path::PathBuf::from);
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("pqeditor")
+            .with_title(build_title())
             .with_inner_size([1280.0, 800.0])
             .with_min_inner_size([720.0, 420.0])
             .with_icon(load_icon()),
@@ -54,6 +56,51 @@ fn main() {
         }),
     )
     .expect("pqeditor crashed");
+}
+
+/// Window title carries the build stamp: a stale exe is recognizable at
+/// a glance (bit us once — dist/ had a pre-fix build for hours).
+fn build_title() -> String {
+    format!(
+        "pqeditor {} (build {})",
+        env!("CARGO_PKG_VERSION"),
+        build_stamp()
+    )
+}
+
+/// Set by build.rs; falls back to "dev" when unset (plain `cargo test`).
+fn build_stamp() -> &'static str {
+    match option_env!("PQEDITOR_BUILD_STAMP") {
+        Some(s) => s,
+        None => "dev",
+    }
+}
+
+/// Panic hook: write panics to a file next to the exe. The Windows GUI
+/// build has no console/stderr, so panics were previously invisible.
+fn install_panic_log() {
+    std::panic::set_hook(Box::new(|info| {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let text = format!("=== panic at unix {} ===\n{info}\n", stamp);
+        let file = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|d| d.join("pqeditor-panic.log")));
+        if let Some(path) = file {
+            use std::io::Write as _;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
+                let _ = f.write_all(text.as_bytes());
+            }
+        }
+        // Also keep the default behavior (stderr) when there is one.
+        eprintln!("{text}");
+    }));
 }
 
 /// 32x32 RGBA icon: dark square with an amber border. Cheap and in-theme.

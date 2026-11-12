@@ -869,6 +869,19 @@ fn worker_loop(
     let mut worker = Worker::new().context("starting duckdb")?;
 
     for job in jobs {
+        // Per-job timing: the first diagnostic step for "slow file open"
+        // class reports. Visible on stderr (wine runs capture it).
+        let job_started = std::time::Instant::now();
+        let job_kind: &'static str = match &job {
+            Job::Open { .. } => "open",
+            Job::Count { .. } => "count",
+            Job::Rows { .. } => "rows",
+            Job::Stats { .. } => "stats",
+            Job::TopValues { .. } => "top_values",
+            Job::SetDeletedRows { .. } => "set_deleted_rows",
+            Job::Save { .. } => "save",
+            Job::Export { .. } => "export",
+        };
         let result = match job {
             Job::Open { path } => match worker.open(&path) {
                 Ok((schema, total)) => JobResult::Opened { schema, total },
@@ -957,6 +970,11 @@ fn worker_loop(
                 },
             },
         };
+        eprintln!(
+            "pqeditor: worker job {:>13} took {:?}",
+            job_kind,
+            job_started.elapsed()
+        );
         if results.send(result).is_err() {
             return Ok(()); // UI closed
         }

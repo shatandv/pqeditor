@@ -84,6 +84,92 @@ mockup.html      visual spec of the UI (open in a browser)
 4. Bad filter input: red error, previous filter intact.
 5. Edit rejected for type mismatch: editor stays open, red message.
 
+## MORNING CHECKLIST (Nov 14, from the overnight Wine session — verify, then fix)
+USER REPORT (stale exe): the user tested dist/pqeditor.exe from Nov 12
+23:34 which predated the Enter/header/drag/clipboard/sort-count fixes —
+every reported symptom matches the pre-fix behavior. dist/ has since
+been refreshed with the final build (md5 b36da1180bbd5067f9ebde3a0318468d).
+LESSON: refresh dist/ after EVERY rebuild round, before reporting (the
+pitfall note exists; it was still missed). Add a visible BUILD STAMP so
+a stale exe is instantly recognizable (prep below).
+
+OBSERVATIONS FROM THE OVERNIGHT SESSION (all need clean reproduction —
+they may be wine+glow artifacts, but treat as real until proven):
+
+1. SAVE -> AUTO-REOPEN DIDN'T REFRESH THE VIEW (possible real bug):
+   edit under sort -> Ctrl+S -> status showed "saved (1 edits applied)"
+   but the grid kept the pre-save data and sort; disk WAS correctly
+   rewritten (verified with a fresh instance: rowid 99999 score=1).
+   So the Done{Save} -> Job::Open -> Opened -> replace FileState flow
+   silently stalled. Suspicion: the worker died after save (panic is
+   invisible: GUI-subsystem exe has no stderr) OR the Open job hung.
+   ACTION: (a) add a panic hook writing to a log file next to the exe
+   (Windows has no stderr!); (b) reproduce in the deterministic driver;
+   (c) check whether save()'s atomic rewrite + immediate re-open races.
+
+2. RENDER DEATH: instance 1's window went permanently black while the
+   process stayed alive (after being fully occluded by another window
+   on the WM-less Xserver). Could be a glow/egl artifact of this setup,
+   could be an app-side context-loss bug. On real Windows with a WM
+   this is unlikely to reproduce the same way, but note it.
+
+3. INPUT DEATH: after a multi-step interaction, clicks stopped
+   registering on an instance that still rendered fine. Suspect a stale
+   egui modal-layer or focus state swallowing input, or harness
+   flakiness (overlapping windows at 0,0 on the nested Xserver — XTEST
+   clicks raced). The deterministic driver settles this.
+
+4. Home/End with NO selection anchor at (0,0) instead of jumping
+   (pre-existing: the None arm of move_selection ignores drow/dcol).
+   Fix: when selection is None, treat drow/dcol as the target directly.
+
+DETERMINISTIC VERIFICATION PLAN (the user explicitly asked for this —
+priority for the next working session):
+
+A. Extract the interaction state machine out of the grid draw closures
+   into FileState/App methods (click_cell(pos,col,shift), drag_to,
+   release_pointer, click_rownum, click_header, open_editor, ...).
+   grid.rs closures become thin wrappers. Then the whole interaction
+   layer is headless-testable: app tests drive clicks/drags/keys and
+   assert selection/editing/overlay/status — no rendering, fully
+   deterministic. This is the single highest-value change.
+
+B. Scripted driver mode (env PQEDITOR_DRIVER=path/to/scenario.txt):
+   actions per line (open <file> / click <pos> <col> / drag / key / save
+   / wait_job / assert_status <text> / assert_selection ...); runs the
+   REAL draw loop under eframe so layer/modal paths get exercised too,
+   dumps per-step state (status, selection, overlay len, row under
+   head) to stdout and exits nonzero on assert failure. Runs under
+   Wine/XTEST-free; the Wine harness then only needs to launch it and
+   read the result file.
+
+C. Per-job timing logs: the worker logs every job's duration to the
+   progress channel; status bar can show "opened in 0.8s". Settles the
+   "slow file open" class of reports with numbers. Consider making
+   Open async-cheap: return the schema fast, let count(*) fill in
+   async (it already does everywhere else) so big/pathological files
+   render rows before the count answers.
+
+D. Visible build stamp: window title "pqeditor 0.1.0 (build
+   2026-11-13 00:32)" via env!("BUILD_TS") written by build.rs — makes
+   a stale exe instantly recognizable (this incident's root cause).
+
+SMALL PREPS ALREADY CODED (uncommitted, compile+test in the morning):
+- panic hook logging to <exe_dir>/pqeditor-panic.log (main.rs) + build
+  stamp via build.rs shown in the window title
+- Home/End with no selection jumps to the target (app.rs
+  move_selection None arm) + pin test home_end_jump_without_selection
+- INTERACTION STATE MACHINE EXTRACTED (app.rs FileState):
+  pointer_on_cell / pointer_release / click_cell / double_click_cell /
+  secondary_click_cell / click_rownum; grid.rs draw closures now just
+  call these. Regression pins written: drag_then_click_does_not_extend
+  (the user's stale-build symptom), click_away_commits_editor,
+  rownum_click_selects_row_and_shift_extends.
+- lib.rs note: build.rs now exists — `cargo test` compiles it; make
+  sure the stamp shows in the title under Wine.
+Do NOT push until the full battery + a Wine pass on the driver run
+green.
+
 ## FEEDBACK ROUND 2 (Nov 13-14) — ALL FIXED, verified via Wine+XTEST loop
 
 USER RULE (permanent): before fixing anything, add tests that pin
