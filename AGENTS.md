@@ -84,26 +84,57 @@ mockup.html      visual spec of the UI (open in a browser)
 4. Bad filter input: red error, previous filter intact.
 5. Edit rejected for type mismatch: editor stays open, red message.
 
-## STATUS NOTE (keep updated; compaction at 50% context)
+## FEEDBACK ROUND 2 (Nov 13 late) — DIAGNOSIS + PLAN (tests first!)
 
-All 11 feedback items from Nov 13 are DONE (22 tests green, exe rebuilt
-in dist/). The big ones: #5 rect selection + TSV copy/paste, #6 row
-deletion (view-level exclusion + atomic save) / column drop (client-side
-hide + EXCLUDE on save; indices stay stable), toolbar layout bug
-(panels are top-down by default — ui.horizontal fixed it), sort sending
-a fresh count(*), unsaved-changes dialog, stable cell-editor id.
-Rowids are stable through deletion because the view computes
-row_number() in a subquery and filters outside it.
+USER RULE (permanent, this is my codebase): before fixing anything, add
+tests that pin currently-CORRECT behavior; run the full battery after
+every round; do a full functional pass (open/sort/filter/edit/save/copy/
+paste/delete/drop/export) via the Wine+xgrab loop before shipping.
 
-Still open / candidate next steps:
-- #10 visual polish toward mockup.html (toolbar spacing, stats strip
-  styling, start screen).
-- Close-with-unsaved-edits is wired; verify once more on real Windows.
-- No "shown/filtered" split in the status bar for deleted-row counts
-  (the view already excludes them; counts are correct).
-- Wine+X11 grab loop is the visual verification tool for the exe
-  (see cross/ and /tmp/opencode/xgrab.c — rebuild if /tmp wiped).
-- multi-file tabs, undo stack, visual-order navigation remain future work.
+ROOT CAUSE identified (fix FIRST, explains #3/#4/#6 + latent sort bug):
+the grid addresses cells by VIEW POSITION (row_idx from egui_extras) but
+the model treats it as the ORIGINAL rowid. Under sort (display order !=
+file order) and after row deletion (view excludes rows) every cell
+lookup hits the wrong row: copy/delete act on wrong rows, sorted data is
+silently wrong. FIX: Job::Rows must return the true __rowid per row
+(engine: add __rowid to the rows SELECT and split it out), cache pages
+store (rowid, cells), model addresses by position and keys overlay by
+true rowid; Sel = view positions; delete_selected_rows maps positions
+to rowids through the cache. Add an App-level test: sort by column, then
+assert the first displayed row's DATA actually changed.
+
+Other items:
+- #1 Enter-starts-edit flashes and disappears + phantom edit marker:
+  not yet explained. commit_editing no-ops on unchanged text, so
+  something sets text != initial. Reproduce via Wine + cua-driver keys
+  (wine windows ARE X11, XTEST works) + xgrab screenshots per step.
+- #2 LMB click/double-click dead: suspect the drag-select press block
+  (is_pointer_button_down_on) fighting clicks + micro-movement extends
+  the rect to neighbors (user's screenshot shows exactly that). 
+  Rework: press sets anchor only if drag not active; only extend when
+  the pointer actually moves to a different cell while down.
+- #3 copy/paste: copy uses the rect (root cause above). Paste: egui
+  Event::Paste may not fire on Windows — plan: use the `arboard` crate
+  for clipboard read/write instead of relying on egui events.
+- #5 drag-select selects text like a paragraph: egui labels are text-
+  selectable now; use Label::selectable(false) on cell labels (verify
+  the API in egui 0.37).
+- #6 sort/RMB-sort blanks the table: verify after the mapping fix; add
+  App-level test asserting first-row data changes after sort.
+- #7 shown count wrong + empty-filter Enter doesn't clear: add app test
+  for submit_filter -> shown_rows; empty draft with an active filter
+  must clear it (currently early-returns because both are None).
+- #8 Export modal grows on every input: auto-sized Modal + TextEdit
+  desired_width(INFINITY) = runaway width. Fix: Modal with fixed size
+  (Modal::area(Area::new(id).fixed_size([480, 0]))) and finite TextEdit
+  widths.
+
+PUSHED: https://github.com/shatandv/pqeditor.git (main). dist/ is
+gitignored (57MB binary); cross/static .a files are committed.
+
+GITHUB PUSH PROCEDURE: git remote add origin
+https://github.com/shatandv/pqeditor.git && git push -u origin main
+(auth via gh or stored credentials — check what works).
 
 
 ## Build/run
