@@ -1,0 +1,14 @@
+# Row-number selection + Del deletes the rows the user sees. After save
+# the worker view filter resets (no double exclusion).
+open <PARQUET>
+wait-open
+page0
+click-row 0
+shift-click-row 1
+press-del
+wait-count 98
+assert-count 98
+save
+wait-save
+assert-count 98
+assert-total 98

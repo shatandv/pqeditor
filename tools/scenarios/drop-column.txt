@@ -1,0 +1,11 @@
+# Drop a column and save: the schema refreshes (re-open) and the sort
+# carries over. Two-column file (id, label).
+open <PARQUET2>
+wait-open
+assert-schema 2
+sort 0 asc
+drop 1
+save
+wait-save
+assert-schema 1
+assert-count 100

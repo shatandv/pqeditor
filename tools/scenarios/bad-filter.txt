@@ -1,0 +1,9 @@
+# A bad filter is rejected with a short error; the previous filter and
+# count survive.
+open <PARQUET>
+wait-open
+filter id > 90
+assert-count 9
+filter id >
+assert-error
+assert-count 9

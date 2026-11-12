@@ -1,0 +1,20 @@
+# Sort descending, copy a 2x2-ish block, paste it elsewhere. Anchoring
+# and the rowid mapping must follow the view, not file order.
+open <PARQUET>
+wait-open
+page0
+sort 0 desc
+page0
+assert-cell 0 0 99
+click 0 0
+copy
+click 5 0
+paste 0\n1
+assert-cell 5 0 0
+assert-cell 6 0 1
+assert-overlay 2
+save
+wait-save
+assert-overlay 0
+assert-cell 5 0 0
+assert-cell 6 0 1

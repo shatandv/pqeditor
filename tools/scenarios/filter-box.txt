@@ -1,0 +1,8 @@
+# SQL filter: shown count matches; submitting an empty box clears.
+open <PARQUET>
+wait-open
+assert-count 100
+filter id > 90
+assert-count 9
+filter-clear
+assert-count 100

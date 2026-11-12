@@ -1,10 +1,11 @@
 //! pqeditor: a barebones spreadsheet-style editor for parquet files.
 //!
-//! Module map (see AGENTS.md for the full architecture):
+//! eframe shell. All application logic lives in the `pqeditor` library
+//! (see DESIGN.md for the component map):
 //! - `data::engine`: duckdb worker thread + job protocol
 //! - `data::model`: windowed row cache + edit overlay (UI thread)
 //! - `data::types`: value types crossing the worker boundary
-//! - `app`: application state and actions
+//! - `app`: application state, commands and result application
 //! - `ui`: drawing code per region
 //! - `theme`: the design system
 
@@ -16,16 +17,9 @@
     windows_subsystem = "windows"
 )]
 
-mod app;
-mod data;
-mod theme;
-mod ui;
-mod util;
-
 use eframe::egui;
 use egui::Key;
-
-pub const STORAGE_KEY: &str = "pqeditor/recents";
+use pqeditor::{app, ui};
 
 fn main() {
     install_panic_log();
@@ -381,6 +375,6 @@ impl app::App {
 
     /// eframe calls this periodically and on exit.
     fn save_state(&mut self, storage: &mut dyn eframe::Storage) {
-        eframe::set_value(storage, STORAGE_KEY, &self.recents);
+        eframe::set_value(storage, pqeditor::app::STORAGE_KEY, &self.recents);
     }
 }

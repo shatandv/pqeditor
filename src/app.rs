@@ -12,6 +12,9 @@ use crate::data::model::{GridState, PAGE_SIZE};
 use crate::data::types::{ColumnSchema, ColumnStats, EditValue, SortKey};
 
 /// Where per-file state lives. One file open at a time (v1).
+/// eframe persistence key for the recent-files list.
+pub const STORAGE_KEY: &str = "pqeditor/recents";
+
 pub struct FileState {
     pub path: PathBuf,
     pub grid: GridState,
@@ -100,15 +103,20 @@ impl FileState {
         self.selection = None;
     }
 
-    /// Sort this column descending (header menu), replacing other keys.
-    pub fn set_sort_desc(&mut self, col: usize) {
+    /// Set the sort stack to exactly this column (header menu commands).
+    pub fn set_sort(&mut self, col: usize, ascending: bool) {
         let sort = vec![SortKey {
             col,
-            ascending: false,
+            ascending,
         }];
         let filter = self.grid.filter.clone();
         self.grid.requery(sort, filter);
         self.selection = None;
+    }
+
+    /// Sort this column descending (header menu), replacing other keys.
+    pub fn set_sort_desc(&mut self, col: usize) {
+        self.set_sort(col, false);
     }
 
     /// Start editing the cell at a view position (type permitting).
@@ -431,8 +439,8 @@ pub struct Recent {
 }
 
 impl App {
-    /// Shared constructor body (App::new and tests).
-    fn with_engine(engine: Engine, recents: Vec<Recent>) -> Self {
+    /// Headless constructor for tests and tool binaries.
+    pub fn with_engine(engine: Engine, recents: Vec<Recent>) -> Self {
         Self {
             engine,
             file: None,
@@ -456,7 +464,7 @@ impl App {
         crate::theme::install_fonts(&cc.egui_ctx);
         let recents: Vec<Recent> = cc
             .storage
-            .and_then(|s| eframe::get_value(s, crate::STORAGE_KEY))
+            .and_then(|s| eframe::get_value(s, STORAGE_KEY))
             .unwrap_or_default();
         match Engine::spawn() {
             Ok(engine) => Self::with_engine(engine, recents),
@@ -646,6 +654,14 @@ impl App {
     pub fn cycle_sort(&mut self, col: usize, append: bool) {
         if let Some(f) = self.file.as_mut() {
             f.cycle_sort(col, append);
+        }
+        self.refresh_count();
+    }
+
+    /// Set the sort directly (driver/tools commands mirror the menu).
+    pub fn set_sort(&mut self, col: usize, ascending: bool) {
+        if let Some(f) = self.file.as_mut() {
+            f.set_sort(col, ascending);
         }
         self.refresh_count();
     }
@@ -1001,7 +1017,11 @@ impl App {
                                 // The saved file no longer contains the
                                 // deleted rows; clear the worker's view
                                 // filter. Rowids of the surviving rows are
-                                // unchanged, so pages stay valid.
+                                // unchanged, so pages stay valid, and the
+                                // file's row count is now the view count.
+                                if let Some(f) = self.file.as_mut() {
+                                    f.total_rows = f.grid.shown_rows;
+                                }
                                 self.engine
                                     .send(Job::SetDeletedRows { rows: vec![] });
                             }

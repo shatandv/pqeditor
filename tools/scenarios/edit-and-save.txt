@@ -1,0 +1,16 @@
+# Edit a cell, save, verify display and disk agree (via page patching:
+# no reload, view state intact). 100-row single-column file (id 0..99).
+open <PARQUET>
+wait-open
+assert-total 100
+page0
+assert-cell 0 0 0
+edit 3 0 500
+assert-overlay 1
+assert-cell 3 0 500
+save
+wait-save
+assert-overlay 0
+assert-cell 3 0 500
+assert-page 3 0 500
+assert-cell 0 0 0
