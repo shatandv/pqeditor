@@ -72,12 +72,14 @@ pub fn run(app: &mut App, line: &str, out: &mut impl Write) -> Result<(), String
             let f = need_file(app)?;
             f.filter_draft = sql;
             app.submit_filter();
+            // Validation done = candidate consumed (applied on success,
+            // cleared with an error on failure; assert-error checks that).
             poll_until(
                 app,
                 |a| {
                     a.file
                         .as_ref()
-                        .map(|f| f.pending_filter.is_none() && f.filter_error.is_none())
+                        .map(|f| f.pending_filter.is_none())
                         .unwrap_or(false)
                 },
                 "filter",
