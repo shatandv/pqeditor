@@ -103,21 +103,18 @@ FINDINGS (Nov 13):
   describe fn individually (core_functions/httplib/loadable syms exist
   in the windows lib).
 Resume checklist:
-1. Wait for the windows test build (with parquet feature); run under
-   Wine from a dir with libc++.dll + libunwind.dll beside the test exe.
-   Expect 18/18 green and no page fault.
-2. Rebuild main exe (glow renderer + windows_subsystem=noconsole already
-   in source). Wine-test the GUI: `cd dist && timeout 30 wine pqeditor.exe`
-   (exit 124 or clean window = pass; grep log for `panicked`).
-3. Self-contained exe experiment: stub libstdc++ (empty archive, llvm-ar
-   rcs), RUSTFLAGS="-C link-arg=-static -C link-arg=-L<stubdir>".
-   The duplicate-symbol failure earlier came from static libc++ colliding
-   with the libstdc++ shim; -static + stub avoids the shim. Verify with
-   llvm-objdump that libc++.dll/libunwind.dll are gone from imports, then
-   Wine-test. If it fails, ship dist/ with the 2 DLLs (current state).
-4. Commit, refresh dist/, report to user.
-5. Linux: `cargo test` (parquet now static; no more ~/.duckdb download
+1. [DONE Nov 13] windows test build with parquet feature: 18/18 green
+   under Wine, no page fault.
+2. [DONE] main exe rebuilt (glow-only eframe, no wgpu; no console window
+   via windows_subsystem). Wine GUI test passes 30s clean.
+3. [DONE] Self-contained exe: early `-L` static dir + `-Wl,-Bstatic`;
+   only system DLL imports remain. Reproduced by
+   `cross/build-windows.sh`.
+4. [DONE] dist/ refreshed: pqeditor.exe (single file) + test-data.parquet.
+5. Linux: `cargo test` with parquet static (no more ~/.duckdb download
    dependency) and `cargo run` once to sanity-check glow on X11.
+6. Update the PAUSED WORK section into a short "Windows build" note and
+   drop the pause framing once everything is verified.
 
 
 ## Build/run
@@ -133,17 +130,28 @@ Release binary is self-contained (bundled DuckDB, bundled font).
 Toolchain: llvm-mingw in `~/.local/llvm-mingw-*` (self-contained tarball
 from github.com/mstorsjo/llvm-mingw, no root), rust target
 `x86_64-pc-windows-gnullvm` (installed via rustup). Linker config lives in
-`.cargo/config.toml`. Build:
+`.cargo/config.toml`. Build with the wrapper script, which also refreshes
+`dist/`:
 
 ```
-export PATH="$HOME/.local/llvm-mingw-20240619-ucrt-ubuntu-20.04-x86_64/bin:$PATH"
-export CC_x86_64_pc_windows_gnullvm=x86_64-w64-mingw32-clang
-export CXX_x86_64_pc_windows_gnullvm=x86_64-w64-mingw32-clang++
-cargo build --release --target x86_64-pc-windows-gnullvm
+./cross/build-windows.sh
 ```
 
-Output: `target/x86_64-pc-windows-gnullvm/release/pqeditor.exe`. Do NOT
-use the plain `x86_64-pc-windows-gnu` target: its link step wants GNU
-libstdc++/libgcc which llvm-mingw does not ship. The C++ runtime for
-DuckDB comes from llvm-mingw's libc++ (`-lc++`, emitted by
-libduckdb-sys). Smoke-test locally with `wine pqeditor.exe`.
+Output: a fully self-contained `dist/pqeditor.exe` — C++ runtime
+(libc++/libunwind) is statically linked via an early `-L` to a
+dir holding only the static `.a` archives + `-Wl,-Bstatic`; the only DLL
+imports left are standard Windows system DLLs (Win10+ ucrt set). PE
+subsystem is WINDOWS_GUI, so double-clicking opens just the app, no
+console.
+
+Pitfalls (all hit, all documented so they stay fixed):
+- Do NOT use the plain `x86_64-pc-windows-gnu` target: GNU libstdc++/
+  libgcc do not exist in llvm-mingw. `gnullvm` is the supported pairing.
+- `duckdb` needs the `parquet` feature or `read_parquet` is missing from
+  the catalog entirely (would otherwise rely on a silent network
+  autoload into ~/.duckdb).
+- Forcing `-lc++` static via a `-Wl,-Bstatic,-lc++` group duplicates
+  symbols with the libstdc++ shim path; the early `-L` static-dir trick
+  (script above) is the working approach.
+- Wine smoke test: `cd dist && timeout 30 wine pqeditor.exe` — exit 124
+  or a clean window = pass; grep the log for `panicked`/`import_dll`.
