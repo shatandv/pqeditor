@@ -105,9 +105,11 @@ STATE AT SLEEP:
 RUNBOOK (in order):
 1. cargo fmt && cargo check --all-targets && cargo clippy
    --all-targets -- -D warnings && cargo test  (fix what the compiler
-   finds; the SaveOutcome rework compiled zero times so far).
-2. Commit the SaveOutcome rework once green ("save flow per DESIGN.md
-   §5"). Push only after the hook passes.
+   finds; the overnight work — SaveOutcome rework, lib split, driver,
+   scenarios — compiled zero times so far). tests/scenarios.rs runs the
+   committed scenarios through src/driver.rs on the real worker.
+2. Commit the rework once green ("design rework: lib split + driver +
+   SaveOutcome"). Push only after the hook passes.
 3. Refactor slices per DESIGN.md, one commit each, battery green
    between slices:
    a. Filter state: move draft/pending/error handling into one

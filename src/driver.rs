@@ -12,6 +12,7 @@
 //! UI uses; no rendering is involved.
 
 use std::io::Write;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crate::app::App;

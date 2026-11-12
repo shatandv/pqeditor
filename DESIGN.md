@@ -171,16 +171,25 @@ focus (`had_focus`).
 
 ## 7. Deterministic verification
 
-- `cargo test` (34+ tests) runs on every push via `.githooks/pre-push`
-  (fmt, clippy -D warnings, full battery). Headless App tests drive the
-  REAL worker through the same command methods the UI uses.
-- Scenario tests cover the user-visible flows end-to-end: open → sort →
-  edit under sort → save (view state survives) → paste all-or-nothing →
-  delete rows / drop columns → save round-trips verified on disk with a
-  fresh DuckDB connection.
+- `cargo test` (unit + headless App scenarios + the committed scenario
+  suite in tests/scenarios.rs) runs on every push via
+  `.githooks/pre-push` (fmt, clippy -D warnings, full battery).
+  Headless tests drive the REAL worker through the same command methods
+  the UI uses.
+- `src/driver.rs` is the scenario interpreter; `src/bin/pqdriver.rs` runs
+  a scenario file against the app (headless here, and usable under real
+  Windows against the actual exe). Committed scenarios live in
+  `tools/scenarios/*.txt` and run as `tests/scenarios.rs` on every push.
+- Scenario coverage: edit+save (page patching), sort+copy+paste under
+  sort (position→rowid), delete rows (view reset, disk count), filter
+  box (shown count, clear, bad filter kept previous), drop column
+  (re-open with carried sort), drag-select state machine, set-NULL
+  (disk-verified), rejected edit (editor stays open).
 - Manual per-round pass: the Wine + nested-Xwayland + XTEST harness
-  (AGENTS.md §verification tooling) — pixel grabs after each step,
-  like-a-human clicking. Required before any exe ships to the user.
+  (AGENTS.md §verification tooling; scripted in tools/wine-pass.sh) —
+  pixel grabs after each step, like-a-human clicking. Required before
+  any exe ships to the user. Cleanup of test windows/processes at the
+  end is mandatory.
 
 ## 8. Known open items
 
