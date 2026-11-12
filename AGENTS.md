@@ -84,37 +84,78 @@ mockup.html      visual spec of the UI (open in a browser)
 4. Bad filter input: red error, previous filter intact.
 5. Edit rejected for type mismatch: editor stays open, red message.
 
-## PAUSED WORK (2026-11-12, resume here)
+## CURRENT WORK (Nov 13 evening) — finishing feedback items #5 and #6
 
-State: 18/18 tests green on Linux. Windows cross-build proven end-to-end.
+Everything else from the user's 11-point feedback list is DONE and
+verified (see git log 546e181/9954153 and below). #5 + #6 are HALF-DONE;
+the code does NOT compile right now. State:
 
-FINDINGS (Nov 13):
-- Root cause of the user's Windows failure found: the cc-based bundled
-  build only compiles the parquet extension when the `parquet` feature
-  is on (duckdb Cargo.toml). Without it, `read_parquet` is missing from
-  the catalog on any machine that cannot autoload it from the network
-  (Linux "worked" only because DuckDB silently downloaded
-  parquet.duckdb_extension into ~/.duckdb at first query — a hidden
-  network dependency, now removed by enabling the feature).
-- Second issue: the static-init extension-registration constructor
-  crashed on Windows (page fault at the same address in test binary and
-  probe). Re-test after the parquet fix; if it still crashes, localize
-  with a probe that calls duckdb_register_static_extension on each
-  describe fn individually (core_functions/httplib/loadable syms exist
-  in the windows lib).
-Resume checklist:
-1. [DONE Nov 13] windows test build with parquet feature: 18/18 green
-   under Wine, no page fault.
-2. [DONE] main exe rebuilt (glow-only eframe, no wgpu; no console window
-   via windows_subsystem). Wine GUI test passes 30s clean.
-3. [DONE] Self-contained exe: early `-L` static dir + `-Wl,-Bstatic`;
-   only system DLL imports remain. Reproduced by
-   `cross/build-windows.sh`.
-4. [DONE] dist/ refreshed: pqeditor.exe (single file) + test-data.parquet.
-5. Linux: `cargo test` with parquet static (no more ~/.duckdb download
-   dependency) and `cargo run` once to sanity-check glow on X11.
-6. Update the PAUSED WORK section into a short "Windows build" note and
-   drop the pause framing once everything is verified.
+DONE in this refactor:
+- model.rs: `Sel { anchor: Cell, head: Cell }` rect selection
+  (Sel::single, Sel::rect(total, ncols), is_whole_rows);
+  EditOverlay gained deleted_rows/deleted_cols (BTreeSets), delete_rows,
+  drop_col, is_row/col_deleted; GridState::copy_rect -> TSV;
+  edit_source_text kept.
+- engine.rs: Worker.deleted_rows + recreate_view() (view gets
+  `WHERE __rowid NOT IN (...)` so count/rows/stats/top-values/export all
+  see deletions); Job::SetDeletedRows { rows } added; Job::Save gained
+  drop_cols; save() deletes rows from __pq_src and EXCLUDEs dropped
+  columns; open() clears deleted_rows + calls recreate_view().
+  NOTE: open() still has its own inline CREATE VIEW before
+  recreate_view — harmless duplication.
+
+STILL TO DO (compile blockers marked !!):
+- !! worker_loop: arm for Job::SetDeletedRows { rows } (set
+  worker.deleted_rows = rows; worker.recreate_view()).
+- !! worker_loop: Job::Save arm must pass drop_cols through to
+  worker.save(&overlay, &drop_cols, &progress).
+- !! app.rs: Sel shape changed -> FileState::selection users break:
+  begin_edit_at reads sel.rowid/col (Sel::single), App::move_selection,
+  App::set_cell_null (make it apply to the whole rect), App
+  copy_selection in main.rs (use grid.copy_rect), app_tests use
+  Sel { rowid, col } -> Sel::single(..).
+- app.rs new actions: delete_selected_rows() (overlay.delete_rows +
+  Job::SetDeletedRows with the union + cycle requery + refresh_count),
+  drop_selected_col(), paste_from_clipboard(text) (parse TSV, anchor at
+  head, validate per column type, fill rect if 1-cell clipboard),
+  copy via grid.copy_rect(sel, max_cells=1_000_000).
+- !! grid.rs: draw_cell/rownum/header use file.selection fields —
+  rework to Sel::rect rendering (rect cells BG_SELECT, head cell
+  BG_SELECT_CELL + accent stroke); row-number click = select whole row
+  (Sel from (r,0) to (r,ncols-1)); skip deleted cols in header loop +
+  cells; Del key handling lives in main.rs.
+- !! main.rs: handle_keys — Ctrl+C uses copy_rect; Del = delete rows
+  (whole-row sel) or set NULL rect (cell sel); paste via
+  `ctx.input(|i| i.raw.events.clone())` filter Event::Paste(text).
+- Job::Save send in App::save must include drop_cols from overlay.
+- Done{Save}: replace manual requery+refresh_count with
+  open_path(path) (re-open refreshes schema after column drops;
+  open_path no longer clears self.file so the grid doesn't flash —
+  if not done yet, check).
+- Confirm-discard (dialogs.rs): after overlay.clear() also send
+  Job::SetDeletedRows { rows: vec![] } + refresh_count.
+- grid.rs: begin_edit_at must refuse on is_row_deleted.
+
+THEN: cargo check/test green (keep 20 tests), visual verify via the
+Wine loop, rebuild exe, refresh dist/, commit, report.
+
+VERIFICATION TOOLING (rebuild if /tmp was wiped):
+- /tmp/opencode/xgrab.c -> xgrab: `gcc xgrab.c -o xgrab -lX11`;
+  grabs an X11 window by id to raw RGB ("XRGB W H\n" header).
+- Loop: ./cross/build-windows.sh (or cargo rustc --target
+  x86_64-pc-windows-gnullvm -- -C link-arg=-L$PWD/cross/static
+  -C link-arg=-Wl,-Bstatic), COPY exe to dist/ (stale-copy bit me),
+  run `wine pqeditor.exe test-data.parquet` in background, find WID:
+  `xwininfo -root -tree | grep pqeditor.exe` — grab the CHILD window
+  named "pqeditor" (1280x800), NOT the 1x1 one; python+zlib to wrap
+  RGB into PNG; then read the PNG.
+- cua-driver get_window_state works for the LINUX binary (AT-SPI) but
+  NOT for wine; screenshots don't work on this box otherwise.
+- eframe __screenshot saves a white buffer here (Wayland) — useless.
+
+CONTEXT: user's 11 feedback items: 1-4,7-11 done; 5 = rect select +
+copy/paste; 6 = row/col select + delete rows/drop column. User likes
+fast feedback loops; compaction may happen.
 
 
 ## Build/run

@@ -120,21 +120,69 @@ impl RowCache {
     }
 }
 
-/// Pending edits: original rowid -> (column index -> value).
-/// `EditValue::Null` is an explicit "set to NULL" edit, distinct from
-/// "no edit for this cell".
+/// A cell address in the grid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cell {
+    pub rowid: u64,
+    pub col: usize,
+}
+
+/// Rectangular selection: everything between `anchor` and `head`
+/// (inclusive). A single selected cell has anchor == head; clicking a row
+/// number selects a full-width rect; selecting a column selects a
+/// full-height one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Sel {
+    pub anchor: Cell,
+    pub head: Cell,
+}
+
+impl Sel {
+    pub fn single(rowid: u64, col: usize) -> Self {
+        let c = Cell { rowid, col };
+        Self { anchor: c, head: c }
+    }
+
+    /// The selected rectangle as (first_row, last_row, first_col, last_col),
+    /// clamped to `ncols`. A whole-column selection (head.rowid = u64::MAX)
+    /// spans all rows given by `total`.
+    pub fn rect(&self, total: u64, ncols: usize) -> (u64, u64, usize, usize) {
+        let r0 = self.anchor.rowid.min(self.head.rowid);
+        let r1 = self.anchor.rowid.max(self.head.rowid);
+        let c0 = self.anchor.col.min(self.head.col);
+        let c1 = self.anchor.col.max(self.head.col);
+        let r1 = r1.min(total.saturating_sub(1));
+        let c0 = c0.min(ncols.saturating_sub(1));
+        let c1 = c1.min(ncols.saturating_sub(1));
+        (r0, r1, c0, c1)
+    }
+
+    /// True when the selection covers every column of one or more rows
+    /// (i.e. it came from row-number clicks).
+    pub fn is_whole_rows(&self, ncols: usize) -> bool {
+        let (_, _, c0, c1) = self.rect(u64::MAX, ncols);
+        c0 == 0 && c1 + 1 == ncols
+    }
+}
+
+/// Pending changes: cell edits, deleted rows, dropped columns.
 #[derive(Default)]
 pub struct EditOverlay {
     edits: HashMap<u64, std::collections::BTreeMap<usize, EditValue>>,
+    pub deleted_rows: std::collections::BTreeSet<u64>,
+    pub deleted_cols: std::collections::BTreeSet<usize>,
 }
 
 impl EditOverlay {
+    /// Total pending change count for the status bar.
     pub fn len(&self) -> usize {
-        self.edits.values().map(|m| m.len()).sum()
+        self.edits.values().map(|m| m.len()).sum::<usize>()
+            + self.deleted_rows.len()
+            + self.deleted_cols.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.edits.is_empty()
+        self.edits.is_empty() && self.deleted_rows.is_empty() && self.deleted_cols.is_empty()
     }
 
     pub fn set(&mut self, rowid: u64, col: usize, val: EditValue) {
@@ -145,8 +193,30 @@ impl EditOverlay {
         self.edits.get(&rowid).and_then(|m| m.get(&col))
     }
 
+    pub fn delete_rows(&mut self, rows: impl IntoIterator<Item = u64>) {
+        self.deleted_rows.extend(rows);
+    }
+
+    pub fn drop_col(&mut self, col: usize) {
+        self.deleted_cols.insert(col);
+        // Edits on a dropped column are meaningless.
+        for m in self.edits.values_mut() {
+            m.remove(&col);
+        }
+    }
+
+    pub fn is_row_deleted(&self, rowid: u64) -> bool {
+        self.deleted_rows.contains(&rowid)
+    }
+
+    pub fn is_col_deleted(&self, col: usize) -> bool {
+        self.deleted_cols.contains(&col)
+    }
+
     pub fn clear(&mut self) {
         self.edits.clear();
+        self.deleted_rows.clear();
+        self.deleted_cols.clear();
     }
 
     pub fn all(&self) -> impl Iterator<Item = (u64, usize, &EditValue)> {
@@ -240,6 +310,47 @@ impl GridState {
     /// Cell text for copy-to-clipboard (overlay applied).
     pub fn copy_text(&mut self, rowid: u64, col: usize) -> Option<String> {
         self.cell(rowid, col).map(|c| c.value.display())
+    }
+
+    /// The selection rectangle as TSV (Ctrl+C). Missing (unfetched) cells
+    /// come out empty; dropped columns are skipped. Returns None for an
+    /// empty or oversized selection.
+    pub fn copy_rect(
+        &mut self,
+        sel: &Sel,
+        max_cells: usize,
+    ) -> Option<String> {
+        let ncols = self.schema.len();
+        let (r0, r1, c0, c1) = sel.rect(self.cache.total(), ncols);
+        if r1 < r0 || c1 < c0 {
+            return None;
+        }
+        let nrows = (r1 - r0 + 1) as usize;
+        let ncols_n = c1 - c0 + 1;
+        if nrows.saturating_mul(ncols_n) > max_cells {
+            return None;
+        }
+        let mut out = String::new();
+        for r in r0..=r1 {
+            if self.overlay.is_row_deleted(r) {
+                continue;
+            }
+            let mut line = String::new();
+            for c in c0..=c1 {
+                if self.overlay.is_col_deleted(c) {
+                    continue;
+                }
+                if !line.is_empty() {
+                    line.push('\t');
+                }
+                line.push_str(&self.cell(r, c).map(|v| v.value.display()).unwrap_or_default());
+            }
+            out.push_str(&line);
+            out.push('\n');
+        }
+        // Drop the trailing newline.
+        out.pop();
+        Some(out)
     }
 
     /// True while row pages are still being fetched.

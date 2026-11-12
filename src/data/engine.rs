@@ -51,8 +51,15 @@ pub enum Job {
     TopValues { col: usize, limit: u32, filter: Option<String> },
     /// Open a parquet file, validate it, return schema + row count.
     Open { path: PathBuf },
+    /// Replace the worker's deleted-row set (and therefore the view).
+    SetDeletedRows { rows: Vec<u64> },
     /// Rewrite the open file with the overlay applied (atomic tmp+rename).
-    Save { overlay: Vec<(u64, usize, EditValue)>, progress: mpsc::Sender<String> },
+    /// `drop_cols` are schema indices of user-deleted columns.
+    Save {
+        overlay: Vec<(u64, usize, EditValue)>,
+        drop_cols: Vec<usize>,
+        progress: mpsc::Sender<String>,
+    },
     /// Export current view (filtered or not) to csv or xlsx.
     Export {
         path: PathBuf,
@@ -158,12 +165,22 @@ struct Worker {
     schema: Vec<ColumnSchema>,
     /// Monotonic suffix so reopened views never collide.
     seq: u64,
+    /// Rowids excluded from the view (user-deleted rows, not yet saved).
+    /// The view is recreated whenever this changes so every query
+    /// (count/rows/stats/top-values/export) sees the deletion.
+    deleted_rows: Vec<u64>,
 }
 
 impl Worker {
     fn new() -> Result<Self> {
         let conn = duckdb::Connection::open_in_memory()?;
-        Ok(Self { conn, path: None, schema: Vec::new(), seq: 0 })
+        Ok(Self {
+            conn,
+            path: None,
+            schema: Vec::new(),
+            seq: 0,
+            deleted_rows: Vec::new(),
+        })
     }
 
     fn view_name(&self) -> String {
@@ -207,7 +224,35 @@ impl Worker {
         }
         self.schema = schema;
         self.path = Some(path);
+        self.deleted_rows.clear();
+        self.recreate_view()?;
         Ok((self.schema.clone(), total as u64))
+    }
+
+    /// Recreate the view, excluding user-deleted rows. Cheap: it is just a
+    /// view definition over read_parquet.
+    fn recreate_view(&mut self) -> Result<()> {
+        let p = self
+            .path
+            .as_ref()
+            .map(|p| path_string(p))
+            .ok_or_else(|| anyhow!("no file open"))?;
+        let mut sql = format!(
+            "CREATE OR REPLACE VIEW {} AS SELECT row_number() OVER () - 1 AS __rowid, * FROM read_parquet({})",
+            self.view_name(),
+            sql_quote(&p),
+        );
+        if !self.deleted_rows.is_empty() {
+            let ids = self
+                .deleted_rows
+                .iter()
+                .map(|r| r.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            sql.push_str(&format!(" WHERE __rowid NOT IN ({ids})"));
+        }
+        self.conn.execute_batch(&sql)?;
+        Ok(())
     }
 
     /// FROM/WHERE/ORDER BY suffix shared by count/rows/export queries.
@@ -364,6 +409,7 @@ impl Worker {
     fn save(
         &mut self,
         overlay: &[(u64, usize, EditValue)],
+        drop_cols: &[usize],
         progress: &mpsc::Sender<String>,
     ) -> Result<String> {
         let target = self
@@ -416,8 +462,33 @@ impl Worker {
             ))?;
         }
 
-        // 4. Write in original file order, then atomic swap.
-        let cols: Vec<String> = self.schema.iter().map(|c| sql_ident(&c.name)).collect();
+        // 3b. Delete user-deleted rows from the snapshot.
+        if !self.deleted_rows.is_empty() {
+            let ids = self
+                .deleted_rows
+                .iter()
+                .map(|r| r.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            self.conn
+                .execute_batch(&format!("DELETE FROM __pq_src WHERE __rowid IN ({ids})"))?;
+        }
+
+        // 4. Write in original file order, then atomic swap. Dropped
+        //    columns are excluded from the output.
+        let drop_names: std::collections::BTreeSet<String> = drop_cols
+            .iter()
+            .filter_map(|c| self.schema.get(*c).map(|s| s.name.clone()))
+            .collect();
+        let cols: Vec<String> = self
+            .schema
+            .iter()
+            .filter(|c| !drop_names.contains(&c.name))
+            .map(|c| sql_ident(&c.name))
+            .collect();
+        if cols.is_empty() {
+            bail!("cannot save a file with no columns left");
+        }
         self.conn.execute_batch(&format!(
             "COPY (SELECT {} FROM __pq_src ORDER BY __rowid) TO {} (FORMAT PARQUET, COMPRESSION zstd)",
             cols.join(", "),
