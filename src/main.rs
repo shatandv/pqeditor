@@ -10,6 +10,8 @@
 
 #![warn(clippy::all)]
 #![allow(clippy::too_many_arguments)]
+// No console window in release builds on Windows.
+#![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
 
 mod app;
 mod data;

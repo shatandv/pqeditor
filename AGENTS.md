@@ -86,29 +86,39 @@ mockup.html      visual spec of the UI (open in a browser)
 
 ## PAUSED WORK (2026-11-12, resume here)
 
-State: 18/18 tests green, Linux build runs clean. Windows cross-build
-proven end-to-end (exe produced; needs libc++.dll + libunwind.dll beside
-it, already in `dist/`). Wine smoke-test found one bug:
+State: 18/18 tests green on Linux. Windows cross-build proven end-to-end.
 
-- eframe default renderer is wgpu (Vulkan/D3D12), which fails under Wine
-  (`Wgpu(RequestDeviceError)`). Fix in progress: set
-  `renderer: eframe::Renderer::Glow` in `src/main.rs` `NativeOptions`.
-  That edit is applied but does NOT compile yet: `E0599` on
-  `eframe::Renderer::Glow`. Almost certainly the eframe dep needs the
-  `glow` feature enabled explicitly:
-  `eframe = { version = "0.37.0", features = ["persistence", "glow"] }`
-  (check eframe 0.37 default features first). Then:
-  1. `cargo check` (fast) to confirm.
-  2. Rebuild exe (rustflags untouched, so expect ~20 min at the 2-job
-     cap; only main.rs changed, so likely just a relink unless eframe
-     features changed, which forces dep rebuild).
-  3. Copy to `dist/`, re-run Wine smoke test
-     (`cd dist && timeout 30 wine pqeditor.exe`; exit code 124 or a
-     clean window = success; grep wine log for `panicked`).
-  4. Commit, then tell the user dist/ holds: pqeditor.exe +
-     libc++.dll + libunwind.dll + test-data.parquet.
-- Renderer change also benefits Linux (glow works on X11 there; already
-  tested).
+FINDINGS (Nov 13):
+- Root cause of the user's Windows failure found: the cc-based bundled
+  build only compiles the parquet extension when the `parquet` feature
+  is on (duckdb Cargo.toml). Without it, `read_parquet` is missing from
+  the catalog on any machine that cannot autoload it from the network
+  (Linux "worked" only because DuckDB silently downloaded
+  parquet.duckdb_extension into ~/.duckdb at first query — a hidden
+  network dependency, now removed by enabling the feature).
+- Second issue: the static-init extension-registration constructor
+  crashed on Windows (page fault at the same address in test binary and
+  probe). Re-test after the parquet fix; if it still crashes, localize
+  with a probe that calls duckdb_register_static_extension on each
+  describe fn individually (core_functions/httplib/loadable syms exist
+  in the windows lib).
+Resume checklist:
+1. Wait for the windows test build (with parquet feature); run under
+   Wine from a dir with libc++.dll + libunwind.dll beside the test exe.
+   Expect 18/18 green and no page fault.
+2. Rebuild main exe (glow renderer + windows_subsystem=noconsole already
+   in source). Wine-test the GUI: `cd dist && timeout 30 wine pqeditor.exe`
+   (exit 124 or clean window = pass; grep log for `panicked`).
+3. Self-contained exe experiment: stub libstdc++ (empty archive, llvm-ar
+   rcs), RUSTFLAGS="-C link-arg=-static -C link-arg=-L<stubdir>".
+   The duplicate-symbol failure earlier came from static libc++ colliding
+   with the libstdc++ shim; -static + stub avoids the shim. Verify with
+   llvm-objdump that libc++.dll/libunwind.dll are gone from imports, then
+   Wine-test. If it fails, ship dist/ with the 2 DLLs (current state).
+4. Commit, refresh dist/, report to user.
+5. Linux: `cargo test` (parquet now static; no more ~/.duckdb download
+   dependency) and `cargo run` once to sanity-check glow on X11.
+
 
 ## Build/run
 
