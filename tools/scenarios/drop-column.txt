@@ -7,5 +7,6 @@ sort 0 asc
 drop 1
 save
 wait-save
+wait-count 100
 assert-schema 1
 assert-count 100

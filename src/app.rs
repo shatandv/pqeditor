@@ -930,8 +930,10 @@ impl App {
                     self.status = format!("opened {}", path.display());
                     let mut file = FileState::new(path, schema, total);
                     // The grid renders from the cache's total; seed it with
-                    // the real row count right away.
+                    // the real row count right away. Without a filter the
+                    // shown count IS the file count.
                     file.grid.cache.set_total(total);
+                    file.grid.shown_rows = total;
                     // A save-with-drops re-open carries the view over so
                     // the grid doesn't jump back to unsorted file order.
                     // Consumed here: later opens must not inherit it.
@@ -939,6 +941,8 @@ impl App {
                         self.pending_save.take().and_then(|p| p.carry)
                     {
                         file.grid.requery(sort, filter);
+                        // The requery zeroed the count; answer it now.
+                        self.refresh_count();
                     }
                     self.file = Some(file);
                     self.push_recent();
