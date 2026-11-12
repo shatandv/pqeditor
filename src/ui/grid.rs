@@ -26,6 +26,7 @@ const COL_DEFAULT_WIDTH: f32 = 130.0;
 /// Deferred header interactions.
 enum HeaderEvent {
     Sort { col: usize, append: bool },
+    SortDesc { col: usize },
     Filter { col: usize },
     Stats { col: usize },
     CopyName { col: usize },
@@ -142,6 +143,7 @@ pub fn draw(ui: &mut Ui, app: &mut App) {
     for event in header_events {
         match event {
             HeaderEvent::Sort { col, append } => file.cycle_sort(col, append),
+            HeaderEvent::SortDesc { col } => file.set_sort_desc(col),
             HeaderEvent::Filter { col } => {
                 if file.grid.schema.get(col).is_some() {
                     let pop = crate::app::FilterPopover::new(col);
@@ -258,9 +260,7 @@ fn draw_header_cell(
             ui.close();
         }
         if ui.button("sort descending").clicked() {
-            events.push(HeaderEvent::Sort { col, append: false });
-            events.push(HeaderEvent::Sort { col, append: false });
-            events.push(HeaderEvent::Sort { col, append: false });
+            events.push(HeaderEvent::SortDesc { col });
             ui.close();
         }
         if ui.button("filter values\u{2026}").clicked() {

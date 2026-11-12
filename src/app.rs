@@ -64,13 +64,19 @@ impl FileState {
         }
     }
 
-    /// Adjust the sort stack: plain click replaces, shift+click appends.
-    /// asc -> desc -> off on the same column.
+    /// Adjust the sort stack: plain click replaces the other keys and
+    /// cycles the clicked column asc -> desc -> off; shift+click appends.
     pub fn cycle_sort(&mut self, col: usize, append: bool) {
         let mut sort = if append {
             self.grid.sort.clone()
         } else {
-            Vec::new()
+            // Keep only this column's key so the cycle can continue.
+            self.grid
+                .sort
+                .iter()
+                .filter(|k| k.col == col)
+                .cloned()
+                .collect()
         };
         match sort.iter().position(|k| k.col == col) {
             Some(i) => {
@@ -85,6 +91,17 @@ impl FileState {
                 ascending: true,
             }),
         }
+        let filter = self.grid.filter.clone();
+        self.grid.requery(sort, filter);
+        self.selection = None;
+    }
+
+    /// Sort this column descending (header menu), replacing other keys.
+    pub fn set_sort_desc(&mut self, col: usize) {
+        let sort = vec![SortKey {
+            col,
+            ascending: false,
+        }];
         let filter = self.grid.filter.clone();
         self.grid.requery(sort, filter);
         self.selection = None;
@@ -918,5 +935,274 @@ mod app_tests {
         f.editing.as_mut().unwrap().text = "42".into();
         f.commit_editing();
         assert_eq!(f.grid.overlay.len(), 1);
+    }
+
+    /// Drive the app like the grid does: ask the worker for page 0 with the
+    /// file's current epoch/sort/filter, then poll so the cache is filled.
+    fn load_page0(app: &mut App) {
+        let (epoch, sort, filter) = {
+            let f = app.file.as_ref().unwrap();
+            (
+                f.grid.cache.epoch(),
+                f.grid.sort.clone(),
+                f.grid.filter.clone(),
+            )
+        };
+        app.engine.send(crate::data::engine::Job::Rows {
+            epoch,
+            page: 0,
+            sort,
+            filter,
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while app.file.as_mut().unwrap().grid.cache.page(0).is_none() {
+            app.poll();
+            assert!(std::time::Instant::now() < deadline, "rows never arrived");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        app.file.as_mut().unwrap().grid.cache.clear_in_flight();
+    }
+
+    /// Wait until a Job::Save round-trip completed (overlay cleared and the
+    /// automatic re-open finished).
+    fn wait_save(app: &mut App) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            app.poll();
+            let done = !app.saving
+                && app
+                    .file
+                    .as_ref()
+                    .map(|f| f.grid.overlay.is_empty())
+                    .unwrap_or(false);
+            if done {
+                return;
+            }
+            assert!(std::time::Instant::now() < deadline, "save never finished");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn parquet_int_count(path: &Path, pred: &str) -> i64 {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.query_row(
+            &format!(
+                "SELECT count(*) FROM read_parquet({}) WHERE {pred}",
+                crate::data::types::sql_quote(&path.to_string_lossy())
+            ),
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn parquet_row_count(path: &Path) -> i64 {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.query_row(
+            &format!(
+                "SELECT count(*) FROM read_parquet({})",
+                crate::data::types::sql_quote(&path.to_string_lossy())
+            ),
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn sort_click_cycles_asc_desc_off() {
+        // Pin: plain clicks on one header cycle asc -> desc -> off; other
+        // keys are replaced.
+        let dir = tmp("sort-cycle");
+        let path = dir.join("t.parquet");
+        make_parquet(&path, 10);
+        let app = &mut App::with_engine(Engine::spawn().unwrap(), Vec::new());
+        app.open_path(path);
+        drain(app);
+
+        app.cycle_sort(0, false);
+        assert_eq!(
+            app.file.as_ref().unwrap().grid.sort,
+            vec![SortKey {
+                col: 0,
+                ascending: true
+            }]
+        );
+        app.cycle_sort(0, false);
+        assert_eq!(
+            app.file.as_ref().unwrap().grid.sort,
+            vec![SortKey {
+                col: 0,
+                ascending: false
+            }]
+        );
+        app.cycle_sort(0, false);
+        assert!(app.file.as_ref().unwrap().grid.sort.is_empty());
+
+        // Shift+click appends; a later plain click on the same column
+        // continues that column's cycle (asc -> desc), dropping other keys.
+        app.cycle_sort(0, false);
+        app.cycle_sort(1, true);
+        assert_eq!(app.file.as_ref().unwrap().grid.sort.len(), 2);
+        app.cycle_sort(1, false);
+        assert_eq!(
+            app.file.as_ref().unwrap().grid.sort,
+            vec![SortKey {
+                col: 1,
+                ascending: false
+            }]
+        );
+    }
+
+    #[test]
+    fn sorted_view_shows_sorted_values() {
+        // Pin: the grid displays the rows the worker returned, first
+        // position first. Under sort the top of the view must show the
+        // extreme value, not the file-order row that used to sit there.
+        let dir = tmp("sorted-display");
+        let path = dir.join("t.parquet");
+        make_parquet(&path, 100);
+        let app = &mut App::with_engine(Engine::spawn().unwrap(), Vec::new());
+        app.open_path(path.clone());
+        drain(app);
+
+        app.cycle_sort(0, false); // id ascending
+        load_page0(app);
+        let v0 = app.file.as_mut().unwrap().grid.cell(0, 0).unwrap().value;
+        assert_eq!(v0, CellValue::Int(0));
+        let v9 = app.file.as_mut().unwrap().grid.cell(9, 0).unwrap().value;
+        assert_eq!(v9, CellValue::Int(9));
+
+        // Descending: position 0 shows the largest id.
+        app.cycle_sort(0, false); // asc -> desc
+        load_page0(app);
+        let v0 = app.file.as_mut().unwrap().grid.cell(0, 0).unwrap().value;
+        assert_eq!(v0, CellValue::Int(99));
+    }
+
+    #[test]
+    fn sorted_edit_lands_on_the_row_you_see() {
+        // Bug pin: editing the first displayed row while sorted descending
+        // must edit that row (id 99), not the file-order row that happens
+        // to share its position.
+        let dir = tmp("sorted-edit");
+        let path = dir.join("t.parquet");
+        make_parquet(&path, 100);
+        let app = &mut App::with_engine(Engine::spawn().unwrap(), Vec::new());
+        app.open_path(path.clone());
+        drain(app);
+
+        app.cycle_sort(0, false); // asc
+        app.cycle_sort(0, false); // desc
+        load_page0(app);
+
+        let f = app.file.as_mut().unwrap();
+        f.selection = Some(Sel::single(0, 0));
+        app.begin_edit();
+        let f = app.file.as_mut().unwrap();
+        f.editing.as_mut().unwrap().text = "999".into();
+        f.commit_editing();
+        assert!(!f.grid.overlay.is_empty(), "edit must land in the overlay");
+
+        app.save();
+        wait_save(app);
+
+        assert_eq!(parquet_int_count(&path, "id = 999"), 1, "edited row");
+        assert_eq!(parquet_int_count(&path, "id = 99"), 0, "old row replaced");
+        assert_eq!(parquet_int_count(&path, "id = 0"), 1, "other rows intact");
+    }
+
+    #[test]
+    fn sorted_delete_removes_the_row_you_see() {
+        // Bug pin: deleting the first displayed row while sorted descending
+        // must delete id 99, not the file-order first row.
+        let dir = tmp("sorted-delete");
+        let path = dir.join("t.parquet");
+        make_parquet(&path, 100);
+        let app = &mut App::with_engine(Engine::spawn().unwrap(), Vec::new());
+        app.open_path(path.clone());
+        drain(app);
+
+        app.cycle_sort(0, false); // asc
+        app.cycle_sort(0, false); // desc
+        load_page0(app);
+
+        let f = app.file.as_mut().unwrap();
+        f.selection = Some(Sel::single_full_row(0, 1));
+        app.delete_selected_rows();
+        assert!(
+            !app.file.as_ref().unwrap().grid.overlay.is_empty(),
+            "deletion must be pending"
+        );
+
+        app.save();
+        wait_save(app);
+
+        assert_eq!(parquet_row_count(&path), 99);
+        assert_eq!(parquet_int_count(&path, "id = 99"), 0, "seen row deleted");
+        assert_eq!(parquet_int_count(&path, "id = 0"), 1, "first row intact");
+    }
+
+    #[test]
+    fn filter_updates_shown_count() {
+        // Bug pin: the status bar's "shown" count must reflect the filter,
+        // not the unfiltered total.
+        let dir = tmp("filter-shown");
+        let path = dir.join("t.parquet");
+        make_parquet(&path, 100);
+        let app = &mut App::with_engine(Engine::spawn().unwrap(), Vec::new());
+        app.open_path(path);
+        drain(app);
+
+        app.file.as_mut().unwrap().filter_draft = "id > 90".into();
+        app.submit_filter();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            app.poll();
+            let f = app.file.as_ref().unwrap();
+            if f.grid.filter.is_some() && f.grid.shown_rows == 9 {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "filter never applied");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(app.file.as_ref().unwrap().grid.shown_rows, 9);
+    }
+
+    #[test]
+    fn empty_submit_clears_active_filter() {
+        // Bug pin: submitting an empty filter box while a filter is active
+        // must clear the filter.
+        let dir = tmp("filter-clear");
+        let path = dir.join("t.parquet");
+        make_parquet(&path, 100);
+        let app = &mut App::with_engine(Engine::spawn().unwrap(), Vec::new());
+        app.open_path(path);
+        drain(app);
+
+        app.file.as_mut().unwrap().filter_draft = "id > 90".into();
+        app.submit_filter();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            app.poll();
+            if app.file.as_ref().unwrap().grid.filter.is_some() {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "filter never applied");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        app.file.as_mut().unwrap().filter_draft.clear();
+        app.submit_filter();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            app.poll();
+            let f = app.file.as_ref().unwrap();
+            if f.grid.filter.is_none() && f.grid.shown_rows == 100 {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "filter never cleared");
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }
