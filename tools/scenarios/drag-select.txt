@@ -1,0 +1,12 @@
+# Drag over three cells selects the rect; release ends it; a later
+# click collapses to that cell only (the stale-build regression).
+open <PARQUET>
+wait-open
+page0
+click 1 0
+drag 2 0
+drag 3 0
+release
+assert-selected 3 0
+click 6 0
+assert-selected 6 0

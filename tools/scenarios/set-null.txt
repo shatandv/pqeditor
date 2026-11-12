@@ -1,0 +1,12 @@
+# Del on a cell selection sets NULL; the displayed value is the null
+# dot and the file gains a NULL after save.
+open <PARQUET>
+wait-open
+page0
+click 2 0
+set-null
+assert-overlay 1
+save
+wait-save
+assert-overlay 0
+assert-page 2 0

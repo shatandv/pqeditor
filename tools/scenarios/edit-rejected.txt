@@ -1,0 +1,14 @@
+# A value that fails validation keeps the editor open with an error;
+# nothing lands in the overlay (all-or-nothing applies to single edits
+# too).
+open <PARQUET>
+wait-open
+page0
+dblclick 1 0
+edit 1 0 not-a-number
+assert-editor-open
+assert-overlay 0
+edit 1 0 42
+assert-editor-closed
+assert-overlay 1
+assert-cell 1 0 42

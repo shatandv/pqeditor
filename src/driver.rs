@@ -282,6 +282,18 @@ pub fn run(app: &mut App, line: &str, out: &mut impl Write) -> Result<(), String
             }
             Ok(())
         }
+        ["assert-editor-open"] => {
+            if need_file(app)?.editing.is_none() {
+                return fail("expected the editor to stay open".into());
+            }
+            Ok(())
+        }
+        ["assert-editor-closed"] => {
+            if need_file(app)?.editing.is_some() {
+                return fail("expected the editor to be closed".into());
+            }
+            Ok(())
+        }
         ["assert-overlay", n] => {
             let n: usize = n.parse().map_err(|_| "bad number".to_string())?;
             let got = need_file(app)?.grid.overlay.len();

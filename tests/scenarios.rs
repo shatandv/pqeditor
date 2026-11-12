@@ -106,6 +106,55 @@ fn run_with_deadline(app: &mut App, scenario: &str, text: &str) -> Option<String
 }
 
 #[test]
+fn scenario_drag_select() {
+    let dir = tmp("drag-select");
+    let p1 = dir.join("one.parquet");
+    make_parquet1(&p1, 100);
+    let text = load_scenario("drag-select.txt", &p1, None);
+    let engine = Engine::spawn().unwrap();
+    let mut app = App::with_engine(engine, Vec::new());
+    let r = run_with_deadline(&mut app, "drag-select", &text);
+    expect_pass("drag-select", r, &app);
+}
+
+#[test]
+fn scenario_set_null() {
+    let dir = tmp("set-null");
+    let p1 = dir.join("one.parquet");
+    make_parquet1(&p1, 100);
+    let text = load_scenario("set-null.txt", &p1, None);
+    let engine = Engine::spawn().unwrap();
+    let mut app = App::with_engine(engine, Vec::new());
+    let r = run_with_deadline(&mut app, "set-null", &text);
+    expect_pass("set-null", r, &app);
+    // The file now holds NULL in row 2.
+    let conn = duckdb::Connection::open_in_memory().unwrap();
+    let nulls: i64 = conn
+        .query_row(
+            &format!(
+                "SELECT count(*) FROM read_parquet({}) WHERE id IS NULL",
+                pqeditor::data::types::sql_quote(&p1.to_string_lossy())
+            ),
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(nulls, 1);
+}
+
+#[test]
+fn scenario_edit_rejected() {
+    let dir = tmp("edit-rejected");
+    let p1 = dir.join("one.parquet");
+    make_parquet1(&p1, 100);
+    let text = load_scenario("edit-rejected.txt", &p1, None);
+    let engine = Engine::spawn().unwrap();
+    let mut app = App::with_engine(engine, Vec::new());
+    let r = run_with_deadline(&mut app, "edit-rejected", &text);
+    expect_pass("edit-rejected", r, &app);
+}
+
+#[test]
 fn scenario_edit_and_save() {
     let dir = tmp("edit-save");
     let p1 = dir.join("one.parquet");
