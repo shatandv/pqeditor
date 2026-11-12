@@ -76,8 +76,11 @@ pub fn draw(ui: &mut Ui, app: &mut App) {
                 .vscroll(true)
                 .auto_shrink([false, false]);
             for _ in 0..ncols_visible {
-                table = table
-                    .column(Column::initial(COL_DEFAULT_WIDTH).resizable(true).clip(true));
+                table = table.column(
+                    Column::initial(COL_DEFAULT_WIDTH)
+                        .resizable(true)
+                        .clip(true),
+                );
             }
             let table = match scroll_to {
                 Some(idx) => table.scroll_to_row(idx, Some(Align::Center)),
@@ -90,21 +93,23 @@ pub fn draw(ui: &mut Ui, app: &mut App) {
                     let visible = &visible_cols;
                     move |mut header| {
                         header.col(|ui| {
-                            ui.with_layout(
-                                egui::Layout::right_to_left(Align::Center),
-                                |ui| {
-                                    ui.label(
-                                        RichText::new("\u{25b2}#")
-                                            .color(theme::TEXT_DIM)
-                                            .size(11.0),
-                                    );
-                                },
-                            );
+                            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                                ui.label(
+                                    RichText::new("\u{25b2}#").color(theme::TEXT_DIM).size(11.0),
+                                );
+                            });
                         });
                         for &ci in visible.iter() {
                             let col = &schema[ci];
                             header.col(|ui| {
-                                draw_header_cell(ui, events, ci, &col.name, &sort_state, filter_text.as_ref());
+                                draw_header_cell(
+                                    ui,
+                                    events,
+                                    ci,
+                                    &col.name,
+                                    &sort_state,
+                                    filter_text.as_ref(),
+                                );
                             });
                         }
                     }
@@ -119,8 +124,8 @@ pub fn draw(ui: &mut Ui, app: &mut App) {
                         });
                         // Row tint: any row inside the selection rect; the
                         // head cell gets its own frame (see draw_cell).
-                        let row_selected = sel_rect
-                            .is_some_and(|(r0, r1, _, _)| rowid >= r0 && rowid <= r1);
+                        let row_selected =
+                            sel_rect.is_some_and(|(r0, r1, _, _)| rowid >= r0 && rowid <= r1);
                         row.col(|ui| {
                             draw_rownum_cell(ui, file, rowid, row_selected, ncols);
                         });
@@ -142,18 +147,18 @@ pub fn draw(ui: &mut Ui, app: &mut App) {
                     let pop = crate::app::FilterPopover::new(col);
                     file.popover = Some(pop);
                     engine.send(Job::TopValues {
-                    col,
-                    limit: 200,
-                    filter: file.grid.filter.clone(),
-                });
+                        col,
+                        limit: 200,
+                        filter: file.grid.filter.clone(),
+                    });
                 }
             }
             HeaderEvent::Stats { col } => {
                 if file.grid.schema.get(col).is_some() {
                     engine.send(Job::Stats {
-                    col,
-                    filter: file.grid.filter.clone(),
-                });
+                        col,
+                        filter: file.grid.filter.clone(),
+                    });
                 }
             }
             HeaderEvent::CopyName { col } => {
@@ -185,10 +190,11 @@ pub fn draw(ui: &mut Ui, app: &mut App) {
             .cache
             .missing_pages(min_seen as u64, (max_seen + 1) as u64);
         let ahead = ((max_seen + 1) as u64) / PAGE_SIZE as u64;
-        pages.extend(file.grid.cache.missing_pages(
-            ahead * PAGE_SIZE as u64,
-            ahead * PAGE_SIZE as u64 + 1,
-        ));
+        pages.extend(
+            file.grid
+                .cache
+                .missing_pages(ahead * PAGE_SIZE as u64, ahead * PAGE_SIZE as u64 + 1),
+        );
         for page in pages {
             engine.send(Job::Rows {
                 epoch: file.grid.cache.epoch(),
@@ -212,7 +218,11 @@ fn draw_header_cell(
     let mut label = RichText::new(name).color(theme::TEXT_HEADER).size(12.5);
     if let Some(pos) = sort.iter().position(|k| k.col == col) {
         let key = sort[pos];
-        let arrow = if key.ascending { "\u{25b2}" } else { "\u{25bc}" };
+        let arrow = if key.ascending {
+            "\u{25b2}"
+        } else {
+            "\u{25bc}"
+        };
         label = RichText::new(format!("{name} {arrow}"))
             .color(theme::ACCENT_TEXT)
             .size(12.5);
@@ -300,7 +310,10 @@ fn draw_rownum_cell(
     } else if resp.clicked() {
         // Shift+click extends the row selection.
         if let Some(sel) = file.selection.as_mut() {
-            sel.head = crate::app::Cell { rowid, col: ncols.saturating_sub(1) };
+            sel.head = crate::app::Cell {
+                rowid,
+                col: ncols.saturating_sub(1),
+            };
         }
     }
     if resp.double_clicked() {
@@ -309,7 +322,11 @@ fn draw_rownum_cell(
     ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
         ui.label(
             RichText::new(fmt_count(rowid))
-                .color(if selected { theme::TEXT } else { theme::TEXT_DIM })
+                .color(if selected {
+                    theme::TEXT
+                } else {
+                    theme::TEXT_DIM
+                })
                 .size(11.0),
         );
     });
@@ -330,7 +347,11 @@ fn draw_cell(
         paint_row_bg(ui, theme::BG_SELECT);
     }
 
-    if file.editing.as_ref().is_some_and(|e| e.rowid == rowid && e.col == col) {
+    if file
+        .editing
+        .as_ref()
+        .is_some_and(|e| e.rowid == rowid && e.col == col)
+    {
         draw_editor(ui, file);
         return;
     }
@@ -371,13 +392,17 @@ fn draw_cell(
     // exact cell rect; right-aligned for numbers.
     let text = match cell.value {
         CellValue::Null => RichText::new("·").color(theme::NULL_DOT).size(13.0),
-        ref v => RichText::new(v.display())
-            .size(13.0)
-            .color(if cell.edited { theme::ACCENT_TEXT } else { theme::TEXT }),
+        ref v => RichText::new(v.display()).size(13.0).color(if cell.edited {
+            theme::ACCENT_TEXT
+        } else {
+            theme::TEXT
+        }),
     };
-    let label = Label::new(text)
-        .sense(Sense::hover())
-        .halign(if numeric { Align::Max } else { Align::Min });
+    let label = Label::new(text).sense(Sense::hover()).halign(if numeric {
+        Align::Max
+    } else {
+        Align::Min
+    });
     ui.put(rect, label);
     if head_here {
         ui.painter().rect_stroke(
@@ -412,7 +437,10 @@ fn draw_cell(
         // Clicking a different cell while an editor is open commits it
         // (click-away = commit, like Excel).
         if file.editing.is_some()
-            && !file.editing.as_ref().is_some_and(|e| e.rowid == rowid && e.col == col)
+            && !file
+                .editing
+                .as_ref()
+                .is_some_and(|e| e.rowid == rowid && e.col == col)
         {
             file.commit_editing();
         }
@@ -451,7 +479,9 @@ fn draw_cell(
 }
 
 fn draw_editor(ui: &mut Ui, file: &mut crate::app::FileState) {
-    let Some(edit) = file.editing.as_mut() else { return };
+    let Some(edit) = file.editing.as_mut() else {
+        return;
+    };
     let width = ui.available_width().max(60.0);
     // Stable id: position-derived ids shift as rows scroll, which would
     // silently discard the edit buffer mid-typing.
@@ -461,8 +491,7 @@ fn draw_editor(ui: &mut Ui, file: &mut crate::app::FileState) {
     let resp = ui.add_sized([width, theme::ROW_HEIGHT - 6.0], editor);
     resp.request_focus();
     let focused = resp.has_focus();
-    let (enter, esc) = ui
-        .input(|i| (i.key_pressed(Key::Enter), i.key_pressed(Key::Escape)));
+    let (enter, esc) = ui.input(|i| (i.key_pressed(Key::Enter), i.key_pressed(Key::Escape)));
     if focused && enter {
         file.commit_editing();
     } else if focused && esc {

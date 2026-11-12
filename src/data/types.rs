@@ -101,11 +101,7 @@ pub fn format_float(v: f64) -> String {
     if v.is_infinite() {
         return if v > 0.0 { "inf".into() } else { "-inf".into() };
     }
-    if v == v.trunc() && v.abs() < 1e15 {
-        format!("{}", v)
-    } else {
-        format!("{}", v)
-    }
+    format!("{v}")
 }
 
 impl fmt::Display for CellValue {
@@ -169,19 +165,19 @@ pub fn validate_edit(ty: ColType, raw: &str) -> Result<EditValue, String> {
             .parse::<f64>()
             .map(|_| EditValue::Text(s.to_string()))
             .map_err(|_| format!("'{}' is not a number", s)),
-        ColType::Boolean => {
-            match s.to_ascii_lowercase().as_str() {
-                "true" | "false" | "t" | "f" | "1" | "0" => Ok(EditValue::Text(s.to_string())),
-                _ => Err(format!("'{}' is not true/false", s)),
-            }
-        }
+        ColType::Boolean => match s.to_ascii_lowercase().as_str() {
+            "true" | "false" | "t" | "f" | "1" | "0" => Ok(EditValue::Text(s.to_string())),
+            _ => Err(format!("'{}' is not true/false", s)),
+        },
         ColType::Date => {
             // Let DuckDB be the authority on save; here just reject obviously
             // wrong text by checking yyyy-mm-dd shape.
             let parts: Vec<&str> = s.splitn(3, '-').collect();
             let ok = parts.len() == 3
                 && parts[0].len() == 4
-                && parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()));
+                && parts
+                    .iter()
+                    .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()));
             if ok {
                 Ok(EditValue::Text(s.to_string()))
             } else {

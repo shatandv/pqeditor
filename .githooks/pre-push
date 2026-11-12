@@ -1,0 +1,21 @@
+#!/bin/sh
+# Pre-push gate: never push broken code. Runs the full battery; any
+# failure aborts the push.
+#
+# Installed via `git config core.hooksPath .githooks` (committed, so
+# fresh clones get it after running that once).
+
+set -e
+echo "[pre-push] cargo check --all-targets"
+cargo check --all-targets 2>&1 | tail -3
+
+echo "[pre-push] cargo fmt --check"
+cargo fmt --check
+
+echo "[pre-push] cargo clippy"
+cargo clippy --all-targets --quiet -- -D warnings 2>&1 | tail -5
+
+echo "[pre-push] cargo test"
+cargo test --quiet 2>&1 | tail -6
+
+echo "[pre-push] all green"

@@ -11,7 +11,10 @@
 #![warn(clippy::all)]
 #![allow(clippy::too_many_arguments)]
 // No console window in release builds on Windows.
-#![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
 
 mod app;
 mod data;
@@ -72,7 +75,7 @@ fn load_icon() -> egui::IconData {
     egui::IconData {
         width: S as u32,
         height: S as u32,
-        rgba: rgba.into(),
+        rgba,
     }
 }
 
@@ -112,7 +115,10 @@ impl eframe::App for app::App {
 
         // Files dragged onto the window (start screen and grid alike).
         let dropped: Vec<_> = ui.input(|i| i.raw.dropped_files.clone());
-        if let Some(f) = dropped.iter().find(|f| f.path() != std::path::Path::new("")) {
+        if let Some(f) = dropped
+            .iter()
+            .find(|f| f.path() != std::path::Path::new(""))
+        {
             self.open_path(f.path().to_path_buf());
         }
 
@@ -289,12 +295,11 @@ impl app::App {
     }
 
     fn copy_selection(&mut self, ctx: &egui::Context) {
-        if let Some(f) = self.file.as_mut() {
-            if let Some(sel) = f.selection {
-                if let Some(text) = f.grid.copy_rect(&sel, 1_000_000) {
-                    ctx.copy_text(text);
-                }
-            }
+        if let Some(f) = self.file.as_mut()
+            && let Some(sel) = f.selection
+            && let Some(text) = f.grid.copy_rect(&sel, 1_000_000)
+        {
+            ctx.copy_text(text);
         }
     }
 }
@@ -304,12 +309,9 @@ impl app::App {
     fn busy(&self) -> bool {
         self.saving
             || self.exporting
-            || self
-                .file
-                .as_ref()
-                .is_some_and(|f| {
-                    f.count_pending || f.pending_filter.is_some() || f.grid.cache_has_pending()
-                })
+            || self.file.as_ref().is_some_and(|f| {
+                f.count_pending || f.pending_filter.is_some() || f.grid.cache_has_pending()
+            })
     }
 
     /// eframe calls this periodically and on exit.

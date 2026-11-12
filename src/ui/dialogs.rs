@@ -23,22 +23,33 @@ pub fn draw(ctx: &egui::Context, app: &mut App) -> bool {
 
 /// Unsaved-changes confirmation (opening another file or quitting).
 fn confirm_dialog(ctx: &egui::Context, app: &mut App) -> bool {
-    let Some(confirm) = app.confirm else { return false };
+    let Some(confirm) = app.confirm else {
+        return false;
+    };
     let mut action: Option<u8> = None; // 0 = save, 1 = discard, 2 = cancel
 
     egui::Modal::new(egui::Id::new("pq-confirm")).show(ctx, |ui| {
-        ui.label(RichText::new("Unsaved changes").color(theme::TEXT_HEADER).size(14.0));
+        ui.label(
+            RichText::new("Unsaved changes")
+                .color(theme::TEXT_HEADER)
+                .size(14.0),
+        );
         ui.add_space(4.0);
-        ui.label(RichText::new(match confirm {
-            crate::app::Confirm::OpenFile =>
-                "Opening another file will discard the unsaved edits.",
-            crate::app::Confirm::Quit =>
-                "Quit and discard the unsaved edits?",
-        }).color(theme::TEXT));
+        ui.label(
+            RichText::new(match confirm {
+                crate::app::Confirm::OpenFile => {
+                    "Opening another file will discard the unsaved edits."
+                }
+                crate::app::Confirm::Quit => "Quit and discard the unsaved edits?",
+            })
+            .color(theme::TEXT),
+        );
         ui.add_space(10.0);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui
-                .add(egui::Button::new(RichText::new("Save").color(theme::ACCENT_TEXT)))
+                .add(egui::Button::new(
+                    RichText::new("Save").color(theme::ACCENT_TEXT),
+                ))
                 .clicked()
             {
                 action = Some(0);
@@ -69,7 +80,8 @@ fn confirm_dialog(ctx: &egui::Context, app: &mut App) -> bool {
                 f.selection = None;
             }
             // Deleted rows were excluded from the view; restore it.
-            app.engine.send(crate::data::engine::Job::SetDeletedRows { rows: vec![] });
+            app.engine
+                .send(crate::data::engine::Job::SetDeletedRows { rows: vec![] });
             app.refresh_count();
             match confirm {
                 crate::app::Confirm::OpenFile => {
@@ -148,43 +160,51 @@ fn filter_popover(ctx: &egui::Context, app: &mut App) -> bool {
 
             ui.add_space(4.0);
             let needle = pop.search.to_lowercase();
-            egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
-                for (value, count) in &pop.values {
-                    if !needle.is_empty() && !value.to_lowercase().contains(&needle) {
-                        continue;
-                    }
-                    ui.horizontal(|ui| {
-                        let mut checked = pop.checked.contains(value);
-                        if ui.checkbox(&mut checked, value).changed() {
-                            if checked {
-                                pop.checked.insert(value.clone());
-                            } else {
-                                pop.checked.remove(value);
-                            }
+            egui::ScrollArea::vertical()
+                .max_height(220.0)
+                .show(ui, |ui| {
+                    for (value, count) in &pop.values {
+                        if !needle.is_empty() && !value.to_lowercase().contains(&needle) {
+                            continue;
                         }
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(
-                                RichText::new(crate::util::fmt_count(*count))
-                                    .color(theme::TEXT_DIM)
-                                    .size(11.0),
+                        ui.horizontal(|ui| {
+                            let mut checked = pop.checked.contains(value);
+                            if ui.checkbox(&mut checked, value).changed() {
+                                if checked {
+                                    pop.checked.insert(value.clone());
+                                } else {
+                                    pop.checked.remove(value);
+                                }
+                            }
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        RichText::new(crate::util::fmt_count(*count))
+                                            .color(theme::TEXT_DIM)
+                                            .size(11.0),
+                                    );
+                                },
                             );
                         });
-                    });
-                }
-                if ty.is_some_and(|t| t != ColType::Other) {
-                    let mut checked = pop.checked.contains(NULL_SENTINEL);
-                    if ui
-                        .checkbox(&mut checked, RichText::new(NULL_SENTINEL).color(theme::TEXT_DIM))
-                        .changed()
-                    {
-                        if checked {
-                            pop.checked.insert(NULL_SENTINEL.into());
-                        } else {
-                            pop.checked.remove(NULL_SENTINEL);
+                    }
+                    if ty.is_some_and(|t| t != ColType::Other) {
+                        let mut checked = pop.checked.contains(NULL_SENTINEL);
+                        if ui
+                            .checkbox(
+                                &mut checked,
+                                RichText::new(NULL_SENTINEL).color(theme::TEXT_DIM),
+                            )
+                            .changed()
+                        {
+                            if checked {
+                                pop.checked.insert(NULL_SENTINEL.into());
+                            } else {
+                                pop.checked.remove(NULL_SENTINEL);
+                            }
                         }
                     }
-                }
-            });
+                });
             if pop.truncated {
                 ui.label(
                     RichText::new("showing top 200 values by frequency")
@@ -198,7 +218,9 @@ fn filter_popover(ctx: &egui::Context, app: &mut App) -> bool {
                     clear_requested = true;
                 }
                 if ui
-                    .add(egui::Button::new(RichText::new("apply").color(theme::ACCENT_TEXT)))
+                    .add(egui::Button::new(
+                        RichText::new("apply").color(theme::ACCENT_TEXT),
+                    ))
                     .clicked()
                 {
                     apply_requested = true;
@@ -206,10 +228,8 @@ fn filter_popover(ctx: &egui::Context, app: &mut App) -> bool {
             });
         });
 
-    if close_requested {
-        if let Some(f) = app.file.as_mut() {
-            f.popover = None;
-        }
+    if close_requested && let Some(f) = app.file.as_mut() {
+        f.popover = None;
     }
     if apply_requested {
         app.apply_popover();
@@ -229,10 +249,7 @@ fn export_dialog(ctx: &egui::Context, app: &mut App) -> bool {
         return false;
     };
     let mut dialog = dialog.clone();
-    let filter_active = app
-        .file
-        .as_ref()
-        .is_some_and(|f| f.grid.filter.is_some());
+    let filter_active = app.file.as_ref().is_some_and(|f| f.grid.filter.is_some());
     let mut cancel = false;
     let mut browse = false;
     let mut submit = false;
@@ -323,7 +340,10 @@ fn export_dialog(ctx: &egui::Context, app: &mut App) -> bool {
             ExportFormat::Csv => "csv",
             ExportFormat::Xlsx => "xlsx",
         };
-        if let Some(path) = rfd::FileDialog::new().add_filter(ext.to_uppercase(), &[ext]).save_file() {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter(ext.to_uppercase(), &[ext])
+            .save_file()
+        {
             dialog.path = path.to_string_lossy().into_owned();
         }
     }
@@ -342,10 +362,8 @@ fn export_dialog(ctx: &egui::Context, app: &mut App) -> bool {
         return false;
     }
     // Persist any edits made this frame.
-    if let Some(f) = app.file.as_mut() {
-        if let Some(current) = f.export_dialog.as_mut() {
-            *current = dialog;
-        }
+    if let Some(current) = app.file.as_mut().and_then(|f| f.export_dialog.as_mut()) {
+        *current = dialog;
     }
     true
 }
@@ -354,11 +372,7 @@ fn goto_row_dialog(ctx: &egui::Context, app: &mut App) -> bool {
     let Some(draft) = app.file.as_ref().and_then(|f| f.goto_row.clone()) else {
         return false;
     };
-    let total = app
-        .file
-        .as_ref()
-        .map(|f| f.shown_rows)
-        .unwrap_or(0);
+    let total = app.file.as_ref().map(|f| f.shown_rows).unwrap_or(0);
     let mut go: Option<u64> = None;
     let mut draft = draft;
 
@@ -373,7 +387,10 @@ fn goto_row_dialog(ctx: &egui::Context, app: &mut App) -> bool {
             if ui.input(|i| i.key_pressed(Key::Enter)) {
                 go = draft.trim().replace(',', "").parse::<u64>().ok();
             }
-            ui.label(RichText::new(format!("of {}", crate::util::fmt_count(total))).color(theme::TEXT_DIM));
+            ui.label(
+                RichText::new(format!("of {}", crate::util::fmt_count(total)))
+                    .color(theme::TEXT_DIM),
+            );
         });
     });
 
@@ -393,4 +410,3 @@ fn goto_row_dialog(ctx: &egui::Context, app: &mut App) -> bool {
     }
     true
 }
-

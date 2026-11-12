@@ -9,7 +9,7 @@ pub fn fmt_count(n: u64) -> String {
     for (i, c) in s.chars().enumerate() {
         out.push(c);
         let rest = digits - i - 1;
-        if rest > 0 && rest % 3 == 0 {
+        if rest > 0 && rest.is_multiple_of(3) {
             out.push(',');
         }
     }

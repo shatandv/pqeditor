@@ -3,7 +3,7 @@
 //! One place to change how the app looks. UI code references colors through
 //! these constants and the helpers below, never through raw literals.
 
-use egui::{style::Selection, Color32, Context, FontId, Vec2, Visuals};
+use egui::{Color32, Context, FontId, Vec2, Visuals, style::Selection};
 
 // -- palette (mirrors mockup.html :root) -----------------------------------
 

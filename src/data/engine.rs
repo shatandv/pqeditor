@@ -14,11 +14,11 @@
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 
 use crate::data::types::{
-    sql_ident, sql_quote, CellValue, ColType, ColumnSchema, ColumnStats, EditValue, NumericStats,
-    SortKey,
+    CellValue, ColType, ColumnSchema, ColumnStats, EditValue, NumericStats, SortKey, sql_ident,
+    sql_quote,
 };
 
 /// Kind of a long operation, reported back in `JobResult::Done`.
@@ -44,11 +44,20 @@ pub enum Job {
     /// `JobResult::Failed` with a short error message.
     Count { epoch: u64, filter: Option<String> },
     /// Rows for one page (0-based page index, `PAGE_SIZE` rows).
-    Rows { epoch: u64, page: u64, sort: Vec<SortKey>, filter: Option<String> },
+    Rows {
+        epoch: u64,
+        page: u64,
+        sort: Vec<SortKey>,
+        filter: Option<String>,
+    },
     /// Column statistics.
     Stats { col: usize, filter: Option<String> },
     /// Top distinct values of a column for the filter popover.
-    TopValues { col: usize, limit: u32, filter: Option<String> },
+    TopValues {
+        col: usize,
+        limit: u32,
+        filter: Option<String>,
+    },
     /// Open a parquet file, validate it, return schema + row count.
     Open { path: PathBuf },
     /// Replace the worker's deleted-row set (and therefore the view).
@@ -72,15 +81,31 @@ pub enum Job {
 
 #[derive(Debug)]
 pub enum JobResult {
-    Count { epoch: u64, total: u64 },
+    Count {
+        epoch: u64,
+        total: u64,
+    },
     Rows(RowBatch),
     Stats(ColumnStats),
-    TopValues { col: usize, values: Vec<(CellValue, u64)>, truncated: bool },
-    Opened { schema: Vec<ColumnSchema>, total: u64 },
+    TopValues {
+        col: usize,
+        values: Vec<(CellValue, u64)>,
+        truncated: bool,
+    },
+    Opened {
+        schema: Vec<ColumnSchema>,
+        total: u64,
+    },
     /// A long operation finished successfully.
-    Done { kind: JobKind, message: String },
+    Done {
+        kind: JobKind,
+        message: String,
+    },
     /// Anything failed; `message` is user-presentable.
-    Failed { source: FailSource, message: String },
+    Failed {
+        source: FailSource,
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,16 +158,17 @@ impl Engine {
     pub fn broken() -> Self {
         let (_, res_rx) = mpsc::channel::<JobResult>();
         let (_, prog_rx) = mpsc::channel::<String>();
-        Self { job_tx: None, progress_tx: None, results: res_rx, progress: prog_rx }
+        Self {
+            job_tx: None,
+            progress_tx: None,
+            results: res_rx,
+            progress: prog_rx,
+        }
     }
 
     pub fn send(&self, job: Job) {
         // The worker runs forever; send only fails if it has panicked.
-        if self
-            .job_tx
-            .as_ref()
-            .is_some_and(|tx| tx.send(job).is_err())
-        {
+        if self.job_tx.as_ref().is_some_and(|tx| tx.send(job).is_err()) {
             eprintln!("pqeditor: worker is gone; job dropped");
         }
     }
@@ -194,9 +220,11 @@ impl Worker {
         // Reject non-parquet input with a short message before anything else.
         let total: i64 = self
             .conn
-            .query_row(&format!("SELECT count(*) FROM read_parquet({})", sql_quote(&p)), [], |r| {
-                r.get(0)
-            })
+            .query_row(
+                &format!("SELECT count(*) FROM read_parquet({})", sql_quote(&p)),
+                [],
+                |r| r.get(0),
+            )
             .with_context(|| format!("cannot read parquet file: {}", path.display()))?;
 
         self.seq += 1;
@@ -211,7 +239,10 @@ impl Worker {
         let mapped = stmt.query_map([], |r| {
             let name: String = r.get(0)?;
             let ty_raw: String = r.get(1)?;
-            Ok(ColumnSchema { name, ty: map_col_type(&ty_raw) })
+            Ok(ColumnSchema {
+                name,
+                ty: map_col_type(&ty_raw),
+            })
         })?;
         let mut schema = Vec::new();
         for row in mapped {
@@ -266,7 +297,7 @@ impl Worker {
                         .schema
                         .get(k.col)
                         .map(|c| sql_ident(&c.name))
-                        .unwrap_or_else(|| format!("__rowid"));
+                        .unwrap_or_else(|| "__rowid".to_string());
                     format!("{col} {}", if k.ascending { "ASC" } else { "DESC" })
                 })
                 .collect();
@@ -281,7 +312,13 @@ impl Worker {
         Ok(n as u64)
     }
 
-    fn rows(&self, epoch: u64, page: u64, sort: &[SortKey], filter: Option<&str>) -> Result<RowBatch> {
+    fn rows(
+        &self,
+        epoch: u64,
+        page: u64,
+        sort: &[SortKey],
+        filter: Option<&str>,
+    ) -> Result<RowBatch> {
         let start = page * crate::data::model::PAGE_SIZE as u64;
         let len = crate::data::model::PAGE_SIZE as u64;
         let mut sql = String::from("SELECT ");
@@ -308,7 +345,11 @@ impl Worker {
         for row in mapped {
             rows.push(row?);
         }
-        Ok(RowBatch { epoch, start_row: start, rows })
+        Ok(RowBatch {
+            epoch,
+            start_row: start,
+            rows,
+        })
     }
 
     fn stats(&self, col: usize, filter: Option<&str>) -> Result<ColumnStats> {
@@ -330,17 +371,17 @@ impl Worker {
             top: Vec::new(),
         };
         {
-            let mut stmt = self
-                .conn
-                .prepare(&format!("SELECT count(*), count({ident}) FROM {view}{where_sql}"))?;
+            let mut stmt = self.conn.prepare(&format!(
+                "SELECT count(*), count({ident}) FROM {view}{where_sql}"
+            ))?;
             let (rows, nonnull): (i64, i64) = stmt.query_row([], |r| Ok((r.get(0)?, r.get(1)?)))?;
             stats.rows = rows as u64;
             stats.nulls = (rows - nonnull) as u64;
         }
         {
-            let mut stmt = self
-                .conn
-                .prepare(&format!("SELECT count(DISTINCT {ident}) FROM {view}{where_sql}"))?;
+            let mut stmt = self.conn.prepare(&format!(
+                "SELECT count(DISTINCT {ident}) FROM {view}{where_sql}"
+            ))?;
             let d: i64 = stmt.query_row([], |r| r.get(0))?;
             stats.distinct = Some(d as u64);
         }
@@ -370,7 +411,12 @@ impl Worker {
 
     /// Distinct values with counts (for the filter popover). Returns one more
     /// than `limit` only via the `truncated` flag; values are capped.
-    fn top_values(&self, col: usize, limit: u32, filter: Option<&str>) -> Result<(Vec<(CellValue, u64)>, bool)> {
+    fn top_values(
+        &self,
+        col: usize,
+        limit: u32,
+        filter: Option<&str>,
+    ) -> Result<(Vec<(CellValue, u64)>, bool)> {
         let schema = self
             .schema
             .get(col)
@@ -407,10 +453,7 @@ impl Worker {
         drop_cols: &[usize],
         progress: &mpsc::Sender<String>,
     ) -> Result<String> {
-        let target = self
-            .path
-            .clone()
-            .ok_or_else(|| anyhow!("no file open"))?;
+        let target = self.path.clone().ok_or_else(|| anyhow!("no file open"))?;
         let tmp = target.with_extension("parquet.tmp");
         let _ = std::fs::remove_file(&tmp);
         progress.send(format!("saving {}", target.display())).ok();
@@ -421,7 +464,9 @@ impl Worker {
             "CREATE OR REPLACE TEMP TABLE __pq_edits(rowid BIGINT, col VARCHAR, val VARCHAR)",
         )?;
         {
-            let mut ins = self.conn.prepare("INSERT INTO __pq_edits VALUES (?, ?, ?)")?;
+            let mut ins = self
+                .conn
+                .prepare("INSERT INTO __pq_edits VALUES (?, ?, ?)")?;
             for (rowid, col, val) in overlay {
                 let name = self
                     .schema
@@ -489,9 +534,14 @@ impl Worker {
             cols.join(", "),
             sql_quote(&path_string(&tmp)),
         ))?;
-        std::fs::rename(&tmp, &target).with_context(|| format!("replacing {}", target.display()))?;
+        std::fs::rename(&tmp, &target)
+            .with_context(|| format!("replacing {}", target.display()))?;
         self.open(&target)?; // fresh view; keeps schema accurate
-        let msg = format!("saved {} ({} edits applied)", target.display(), overlay.len());
+        let msg = format!(
+            "saved {} ({} edits applied)",
+            target.display(),
+            overlay.len()
+        );
         progress.send(msg.clone()).ok();
         Ok(msg)
     }
@@ -556,7 +606,7 @@ impl Worker {
             let row = row?;
             writer.write_record(row.iter().map(|c| c.display()))?;
             n += 1;
-            if n % 100_000 == 0 {
+            if n.is_multiple_of(100_000) {
                 progress.send(format!("exporting\u{2026} {n} rows")).ok();
             }
         }
@@ -629,7 +679,7 @@ impl Worker {
                 }
             }
             n += 1;
-            if n % 100_000 == 0 {
+            if n.is_multiple_of(100_000) {
                 progress.send(format!("exporting\u{2026} {n} rows")).ok();
             }
         }
@@ -724,9 +774,11 @@ fn value_to_cell(v: &duckdb::types::Value) -> CellValue {
         V::Date32(d) => CellValue::Temporal(format_date(*d)),
         V::Time64(unit, raw) => CellValue::Temporal(format_time(unit.to_micros(*raw) as u64)),
         V::Timestamp(unit, raw) => CellValue::Temporal(format_timestamp(unit.to_micros(*raw))),
-        V::Interval { months, days, nanos } => {
-            CellValue::Other(format!("interval {months}m {days}d {nanos}ns"))
-        }
+        V::Interval {
+            months,
+            days,
+            nanos,
+        } => CellValue::Other(format!("interval {months}m {days}d {nanos}ns")),
         V::Decimal(d) => CellValue::Float(d.to_string().parse().unwrap_or(f64::NAN)),
         V::Enum(s) => CellValue::Text(s.clone()),
         other => CellValue::Other(format!("{other:?}")),
@@ -744,7 +796,12 @@ fn format_time(micros: u64) -> String {
     let secs = micros / 1_000_000;
     let sub = micros % 1_000_000;
     if sub == 0 {
-        format!("{:02}:{:02}:{:02}", secs / 3600, (secs / 60) % 60, secs % 60)
+        format!(
+            "{:02}:{:02}:{:02}",
+            secs / 3600,
+            (secs / 60) % 60,
+            secs % 60
+        )
     } else {
         format!(
             "{:02}:{:02}:{:02}.{:06}",
@@ -808,45 +865,90 @@ fn worker_loop(
         let result = match job {
             Job::Open { path } => match worker.open(&path) {
                 Ok((schema, total)) => JobResult::Opened { schema, total },
-                Err(e) => JobResult::Failed { source: FailSource::General, message: short_error(e) },
+                Err(e) => JobResult::Failed {
+                    source: FailSource::General,
+                    message: short_error(e),
+                },
             },
             Job::SetDeletedRows { rows } => {
                 worker.deleted_rows = rows;
                 match worker.recreate_view() {
                     Ok(()) => continue, // no answer needed; UI requeries itself
-                    Err(e) => JobResult::Failed { source: FailSource::General, message: short_error(e) },
+                    Err(e) => JobResult::Failed {
+                        source: FailSource::General,
+                        message: short_error(e),
+                    },
                 }
             }
             Job::Count { epoch, filter } => match worker.count(filter.as_deref()) {
                 Ok(total) => JobResult::Count { epoch, total },
-                Err(e) => JobResult::Failed { source: FailSource::Filter, message: short_error(e) },
+                Err(e) => JobResult::Failed {
+                    source: FailSource::Filter,
+                    message: short_error(e),
+                },
             },
-            Job::Rows { epoch, page, sort, filter } => {
-                match worker.rows(epoch, page, &sort, filter.as_deref()) {
-                    Ok(batch) => JobResult::Rows(batch),
-                    Err(e) => JobResult::Failed { source: FailSource::Rows, message: short_error(e) },
-                }
-            }
+            Job::Rows {
+                epoch,
+                page,
+                sort,
+                filter,
+            } => match worker.rows(epoch, page, &sort, filter.as_deref()) {
+                Ok(batch) => JobResult::Rows(batch),
+                Err(e) => JobResult::Failed {
+                    source: FailSource::Rows,
+                    message: short_error(e),
+                },
+            },
             Job::Stats { col, filter } => match worker.stats(col, filter.as_deref()) {
                 Ok(s) => JobResult::Stats(s),
-                Err(e) => JobResult::Failed { source: FailSource::General, message: short_error(e) },
+                Err(e) => JobResult::Failed {
+                    source: FailSource::General,
+                    message: short_error(e),
+                },
             },
-            Job::TopValues { col, limit, filter } => match worker.top_values(col, limit, filter.as_deref()) {
-                Ok((values, truncated)) => JobResult::TopValues { col, values, truncated },
-                Err(e) => JobResult::Failed { source: FailSource::General, message: short_error(e) },
-            },
-            Job::Save { overlay, drop_cols, progress } => {
-                match worker.save(&overlay, &drop_cols, &progress) {
-                    Ok(message) => JobResult::Done { kind: JobKind::Save, message },
-                    Err(e) => JobResult::Failed { source: FailSource::General, message: short_error(e) },
+            Job::TopValues { col, limit, filter } => {
+                match worker.top_values(col, limit, filter.as_deref()) {
+                    Ok((values, truncated)) => JobResult::TopValues {
+                        col,
+                        values,
+                        truncated,
+                    },
+                    Err(e) => JobResult::Failed {
+                        source: FailSource::General,
+                        message: short_error(e),
+                    },
                 }
             }
-            Job::Export { path, filter, format, delimiter, progress } => {
-                match worker.export(&path, filter.as_deref(), format, delimiter, &progress) {
-                    Ok(message) => JobResult::Done { kind: JobKind::Export, message },
-                    Err(e) => JobResult::Failed { source: FailSource::General, message: short_error(e) },
-                }
-            }
+            Job::Save {
+                overlay,
+                drop_cols,
+                progress,
+            } => match worker.save(&overlay, &drop_cols, &progress) {
+                Ok(message) => JobResult::Done {
+                    kind: JobKind::Save,
+                    message,
+                },
+                Err(e) => JobResult::Failed {
+                    source: FailSource::General,
+                    message: short_error(e),
+                },
+            },
+            Job::Export {
+                path,
+                filter,
+                format,
+                delimiter,
+                progress,
+            } => match worker.export(&path, filter.as_deref(), format, delimiter, &progress) {
+                Ok(message) => JobResult::Done {
+                    kind: JobKind::Export,
+                    message,
+                },
+                Err(e) => JobResult::Failed {
+                    source: FailSource::General,
+                    message: short_error(e),
+                },
+            },
         };
         if results.send(result).is_err() {
             return Ok(()); // UI closed
@@ -899,13 +1001,16 @@ mod integration_tests {
 
     struct TestApp {
         engine: Engine,
+        #[allow(dead_code)]
         path: std::path::PathBuf,
     }
 
     impl TestApp {
         fn open(path: &std::path::Path) -> Self {
             let engine = Engine::spawn().unwrap();
-            engine.send(Job::Open { path: path.to_path_buf() });
+            engine.send(Job::Open {
+                path: path.to_path_buf(),
+            });
             match recv(&engine) {
                 JobResult::Opened { schema, total } => {
                     assert_eq!(total, 100);
@@ -914,7 +1019,10 @@ mod integration_tests {
                     assert!(matches!(schema[0].ty, ColType::Integer));
                     assert!(matches!(schema[2].ty, ColType::Text));
                     assert!(matches!(schema[3].ty, ColType::Date));
-                    Self { engine, path: path.to_path_buf() }
+                    Self {
+                        engine,
+                        path: path.to_path_buf(),
+                    }
                 }
                 other => panic!("expected Opened, got {other:?}"),
             }
@@ -929,7 +1037,12 @@ mod integration_tests {
         }
 
         fn rows(&self, page: u64, sort: Vec<SortKey>, filter: Option<String>) -> RowBatch {
-            self.engine.send(Job::Rows { epoch: 0, page, sort, filter });
+            self.engine.send(Job::Rows {
+                epoch: 0,
+                page,
+                sort,
+                filter,
+            });
             match recv(&self.engine) {
                 JobResult::Rows(b) => b,
                 other => panic!("expected Rows, got {other:?}"),
@@ -950,7 +1063,10 @@ mod integration_tests {
 
         let batch = app.rows(0, Vec::new(), None);
         assert_eq!(batch.start_row, 0);
-        assert_eq!(batch.rows.len(), crate::data::model::PAGE_SIZE.min(100) as usize);
+        assert_eq!(
+            batch.rows.len(),
+            crate::data::model::PAGE_SIZE.min(100) as usize
+        );
         // First row, first column: id = 0.
         assert_eq!(batch.rows[0][0], CellValue::Int(0));
         // Row 0: i % 3 == 0 -> label null.
@@ -961,13 +1077,23 @@ mod integration_tests {
         // Sorted descending by id: first row is id = 99.
         let batch = app.rows(
             0,
-            vec![SortKey { col: 0, ascending: false }],
+            vec![SortKey {
+                col: 0,
+                ascending: false,
+            }],
             None,
         );
         assert_eq!(batch.rows[0][0], CellValue::Int(99));
 
         // Sorted ascending by score: first is id 0, score 0.0.
-        let batch = app.rows(0, vec![SortKey { col: 1, ascending: true }], None);
+        let batch = app.rows(
+            0,
+            vec![SortKey {
+                col: 1,
+                ascending: true,
+            }],
+            None,
+        );
         assert_eq!(batch.rows[0][0], CellValue::Int(0));
     }
 
@@ -977,9 +1103,15 @@ mod integration_tests {
         let path = dir.join("t.parquet");
         make_parquet(&path, 100);
         let app = TestApp::open(&path);
-        app.engine.send(Job::Count { epoch: 0, filter: Some("id >".into()) });
+        app.engine.send(Job::Count {
+            epoch: 0,
+            filter: Some("id >".into()),
+        });
         match recv(&app.engine) {
-            JobResult::Failed { source: FailSource::Filter, message } => {
+            JobResult::Failed {
+                source: FailSource::Filter,
+                message,
+            } => {
                 assert!(!message.is_empty());
                 assert!(message.lines().count() <= 2, "should be short: {message}");
             }
@@ -994,7 +1126,10 @@ mod integration_tests {
         make_parquet(&path, 100);
         let app = TestApp::open(&path);
 
-        app.engine.send(Job::Stats { col: 0, filter: None });
+        app.engine.send(Job::Stats {
+            col: 0,
+            filter: None,
+        });
         match recv(&app.engine) {
             JobResult::Stats(s) => {
                 assert_eq!(s.rows, 100);
@@ -1007,9 +1142,15 @@ mod integration_tests {
             other => panic!("expected Stats, got {other:?}"),
         }
 
-        app.engine.send(Job::TopValues { col: 2, limit: 200, filter: None });
+        app.engine.send(Job::TopValues {
+            col: 2,
+            limit: 200,
+            filter: None,
+        });
         match recv(&app.engine) {
-            JobResult::TopValues { values, truncated, .. } => {
+            JobResult::TopValues {
+                values, truncated, ..
+            } => {
                 // 33 non-null labels of 100 (i % 3 != 0) + 1 null group.
                 assert_eq!(values.len(), 67, "33 distinct labels + null");
                 assert!(!truncated);
@@ -1033,9 +1174,16 @@ mod integration_tests {
             (5, 1, EditValue::Text("99.5".into())),
         ];
         let (tx, _rx) = mpsc::channel::<String>();
-        app.engine.send(Job::Save { overlay, drop_cols: vec![], progress: tx });
+        app.engine.send(Job::Save {
+            overlay,
+            drop_cols: vec![],
+            progress: tx,
+        });
         match recv(&app.engine) {
-            JobResult::Done { kind: JobKind::Save, message } => {
+            JobResult::Done {
+                kind: JobKind::Save,
+                message,
+            } => {
                 assert!(message.contains("saved"));
             }
             JobResult::Failed { message, .. } => panic!("save failed: {message}"),
@@ -1092,7 +1240,10 @@ mod integration_tests {
             progress: tx,
         });
         match recv(&app.engine) {
-            JobResult::Done { kind: JobKind::Export, message } => {
+            JobResult::Done {
+                kind: JobKind::Export,
+                message,
+            } => {
                 assert!(message.contains("59 rows"), "{message}");
             }
             JobResult::Failed { message, .. } => panic!("export failed: {message}"),
@@ -1124,7 +1275,10 @@ mod integration_tests {
             progress: tx,
         });
         match recv(&app.engine) {
-            JobResult::Done { kind: JobKind::Export, message } => {
+            JobResult::Done {
+                kind: JobKind::Export,
+                message,
+            } => {
                 assert!(message.contains("100 rows"), "{message}");
             }
             JobResult::Failed { message, .. } => panic!("export failed: {message}"),
@@ -1152,7 +1306,6 @@ mod integration_tests {
         }
     }
 }
-
 
 #[cfg(test)]
 mod deletion_tests {
@@ -1200,10 +1353,15 @@ mod deletion_tests {
         engine.send(Job::Open { path: path.clone() });
         assert!(matches!(recv(&engine), JobResult::Opened { .. }));
 
-        engine.send(Job::SetDeletedRows { rows: vec![0, 1, 2] });
+        engine.send(Job::SetDeletedRows {
+            rows: vec![0, 1, 2],
+        });
 
         // The count must reflect the view (97 rows).
-        engine.send(Job::Count { epoch: 0, filter: None });
+        engine.send(Job::Count {
+            epoch: 0,
+            filter: None,
+        });
         match recv(&engine) {
             JobResult::Count { total, .. } => assert_eq!(total, 97),
             other => panic!("expected Count, got {other:?}"),
@@ -1211,13 +1369,26 @@ mod deletion_tests {
 
         // Save: the file on disk must lose the three rows.
         let (tx, _rx) = mpsc::channel::<String>();
-        engine.send(Job::Save { overlay: vec![], drop_cols: vec![], progress: tx });
-        assert!(matches!(recv(&engine), JobResult::Done { kind: JobKind::Save, .. }));
+        engine.send(Job::Save {
+            overlay: vec![],
+            drop_cols: vec![],
+            progress: tx,
+        });
+        assert!(matches!(
+            recv(&engine),
+            JobResult::Done {
+                kind: JobKind::Save,
+                ..
+            }
+        ));
 
         let conn = duckdb::Connection::open_in_memory().unwrap();
         let n: i64 = conn
             .query_row(
-                &format!("SELECT count(*) FROM read_parquet({})", crate::data::types::sql_quote(&path.to_string_lossy())),
+                &format!(
+                    "SELECT count(*) FROM read_parquet({})",
+                    crate::data::types::sql_quote(&path.to_string_lossy())
+                ),
                 [],
                 |r| r.get(0),
             )
@@ -1235,13 +1406,26 @@ mod deletion_tests {
         assert!(matches!(recv(&engine), JobResult::Opened { .. }));
 
         let (tx, _rx) = mpsc::channel::<String>();
-        engine.send(Job::Save { overlay: vec![], drop_cols: vec![1], progress: tx });
-        assert!(matches!(recv(&engine), JobResult::Done { kind: JobKind::Save, .. }));
+        engine.send(Job::Save {
+            overlay: vec![],
+            drop_cols: vec![1],
+            progress: tx,
+        });
+        assert!(matches!(
+            recv(&engine),
+            JobResult::Done {
+                kind: JobKind::Save,
+                ..
+            }
+        ));
 
         let conn = duckdb::Connection::open_in_memory().unwrap();
         let cols: i64 = conn
             .query_row(
-                &format!("SELECT count(*) FROM (DESCRIBE SELECT * FROM read_parquet({}))", crate::data::types::sql_quote(&path.to_string_lossy())),
+                &format!(
+                    "SELECT count(*) FROM (DESCRIBE SELECT * FROM read_parquet({}))",
+                    crate::data::types::sql_quote(&path.to_string_lossy())
+                ),
                 [],
                 |r| r.get(0),
             )
@@ -1249,7 +1433,10 @@ mod deletion_tests {
         assert_eq!(cols, 1);
         let n: i64 = conn
             .query_row(
-                &format!("SELECT count(*) FROM read_parquet({})", crate::data::types::sql_quote(&path.to_string_lossy())),
+                &format!(
+                    "SELECT count(*) FROM read_parquet({})",
+                    crate::data::types::sql_quote(&path.to_string_lossy())
+                ),
                 [],
                 |r| r.get(0),
             )

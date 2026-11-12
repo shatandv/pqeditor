@@ -5,10 +5,10 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::data::engine::{Engine, FailSource, Job, JobKind, JobResult};
 pub use crate::data::engine::ExportFormat;
-use crate::data::model::{GridState, PAGE_SIZE};
+use crate::data::engine::{Engine, FailSource, Job, JobKind, JobResult};
 pub use crate::data::model::{Cell, Sel};
+use crate::data::model::{GridState, PAGE_SIZE};
 use crate::data::types::{ColumnSchema, ColumnStats, EditValue, SortKey};
 
 /// Where per-file state lives. One file open at a time (v1).
@@ -67,7 +67,11 @@ impl FileState {
     /// Adjust the sort stack: plain click replaces, shift+click appends.
     /// asc -> desc -> off on the same column.
     pub fn cycle_sort(&mut self, col: usize, append: bool) {
-        let mut sort = if append { self.grid.sort.clone() } else { Vec::new() };
+        let mut sort = if append {
+            self.grid.sort.clone()
+        } else {
+            Vec::new()
+        };
         match sort.iter().position(|k| k.col == col) {
             Some(i) => {
                 if sort[i].ascending {
@@ -76,7 +80,10 @@ impl FileState {
                     sort.remove(i);
                 }
             }
-            None => sort.push(SortKey { col, ascending: true }),
+            None => sort.push(SortKey {
+                col,
+                ascending: true,
+            }),
         }
         let filter = self.grid.filter.clone();
         self.grid.requery(sort, filter);
@@ -90,7 +97,9 @@ impl FileState {
             self.commit_error = Some("row is deleted (unsaved)".into());
             return;
         }
-        let Some(schema) = self.grid.schema.get(col) else { return };
+        let Some(schema) = self.grid.schema.get(col) else {
+            return;
+        };
         if self.grid.overlay.is_col_deleted(col) {
             self.commit_error = Some("column is dropped (unsaved)".into());
             return;
@@ -104,14 +113,23 @@ impl FileState {
             return;
         }
         let text = self.grid.edit_source_text(rowid, col).unwrap_or_default();
-        self.editing = Some(EditState { rowid, col, initial: text.clone(), text });
+        self.editing = Some(EditState {
+            rowid,
+            col,
+            initial: text.clone(),
+            text,
+        });
     }
 
     /// Drop a column: hidden client-side, excluded from save. Indices stay
     /// stable.
     pub fn drop_col(&mut self, col: usize) {
         if self.grid.schema.len()
-            <= self.grid.schema.len().saturating_sub(self.grid.overlay.deleted_cols.len())
+            <= self
+                .grid
+                .schema
+                .len()
+                .saturating_sub(self.grid.overlay.deleted_cols.len())
         {
             // Only refuse when dropping would leave zero visible columns.
         }
@@ -132,7 +150,9 @@ impl FileState {
     /// editor stays open and the error is recorded.
     pub fn commit_editing(&mut self) {
         self.commit_error = None;
-        let Some(edit) = self.editing.clone() else { return };
+        let Some(edit) = self.editing.clone() else {
+            return;
+        };
         let Some(schema) = self.grid.schema.get(edit.col) else {
             self.editing = None;
             return;
@@ -159,7 +179,6 @@ impl FileState {
         let sort = self.grid.sort.clone();
         self.grid.requery(sort, filter);
     }
-
 }
 
 #[derive(Debug, Clone)]
@@ -344,8 +363,7 @@ impl App {
             .all()
             .map(|(r, c, v)| (r, c, v.clone()))
             .collect();
-        let drop_cols: Vec<usize> =
-            file.grid.overlay.deleted_cols.iter().copied().collect();
+        let drop_cols: Vec<usize> = file.grid.overlay.deleted_cols.iter().copied().collect();
         self.saving = true;
         self.status = "saving\u{2026}".into();
         self.engine.send(Job::Save {
@@ -356,7 +374,9 @@ impl App {
     }
 
     pub fn open_export_dialog(&mut self) {
-        let Some(file) = self.file.as_mut() else { return };
+        let Some(file) = self.file.as_mut() else {
+            return;
+        };
         if self.exporting {
             return;
         }
@@ -364,7 +384,11 @@ impl App {
         let default_path = file.path.with_extension("csv");
         self.error = None;
         file.export_dialog = Some(ExportDialog {
-            scope: if filter_active { ExportScope::Filtered } else { ExportScope::All },
+            scope: if filter_active {
+                ExportScope::Filtered
+            } else {
+                ExportScope::All
+            },
             format: ExportFormat::Csv,
             delimiter: ';',
             path: default_path.to_string_lossy().into_owned(),
@@ -372,8 +396,12 @@ impl App {
     }
 
     pub fn start_export(&mut self) {
-        let Some(file) = self.file.as_ref() else { return };
-        let Some(dialog) = file.export_dialog.as_ref() else { return };
+        let Some(file) = self.file.as_ref() else {
+            return;
+        };
+        let Some(dialog) = file.export_dialog.as_ref() else {
+            return;
+        };
         if self.exporting || self.saving {
             return;
         }
@@ -402,7 +430,9 @@ impl App {
 
     /// Submit the filter box contents for validation + application.
     pub fn submit_filter(&mut self) {
-        let Some(file) = self.file.as_mut() else { return };
+        let Some(file) = self.file.as_mut() else {
+            return;
+        };
         let draft = file.filter_draft.trim().to_string();
         let filter = if draft.is_empty() { None } else { Some(draft) };
         // Same filter as applied -> nothing to do.
@@ -421,7 +451,9 @@ impl App {
     }
 
     pub fn clear_filter(&mut self) {
-        let Some(file) = self.file.as_mut() else { return };
+        let Some(file) = self.file.as_mut() else {
+            return;
+        };
         file.pending_filter = None;
         file.filter_error = None;
         if file.grid.filter.is_none() {
@@ -457,8 +489,12 @@ impl App {
         // Snapshot the popover state, then release the borrow before
         // requerying.
         let (col, checked, values) = {
-            let Some(file) = self.file.as_ref() else { return };
-            let Some(pop) = file.popover.as_ref() else { return };
+            let Some(file) = self.file.as_ref() else {
+                return;
+            };
+            let Some(pop) = file.popover.as_ref() else {
+                return;
+            };
             (pop.col, pop.checked.clone(), pop.values.clone())
         };
         if let Some(f) = self.file.as_mut() {
@@ -497,10 +533,10 @@ impl App {
         };
         // A popover filter replaces the box filter: too clever to merge into
         // arbitrary SQL; the box filter is cleared when the popover applies.
-        if fragment.is_some() {
-            if let Some(f) = self.file.as_mut() {
-                f.filter_draft.clear();
-            }
+        if fragment.is_some()
+            && let Some(f) = self.file.as_mut()
+        {
+            f.filter_draft.clear();
         }
         if let Some(f) = self.file.as_mut() {
             let sort = f.grid.sort.clone();
@@ -581,7 +617,7 @@ impl App {
         for (i, line) in lines.iter().enumerate() {
             let fields: Vec<&str> = if one_cell {
                 // A single value fills every cell of the selection rect.
-                let width = (c1 - c0 + 1) as usize;
+                let width = c1 - c0 + 1;
                 let height = (r1 - r0 + 1) as usize;
                 if r0 + height as u64 > total {
                     rejected = Some("paste overflows the row count".into());
@@ -589,7 +625,7 @@ impl App {
                 }
                 let mut v = Vec::new();
                 for _ in 0..height {
-                    v.extend(std::iter::repeat(line).take(width));
+                    v.extend(std::iter::repeat_n(line, width));
                 }
                 v
             } else {
@@ -598,7 +634,9 @@ impl App {
             for (j, raw) in fields.iter().enumerate() {
                 let row = r0 + i as u64;
                 let col = c0 + j;
-                let Some(schema) = f.grid.schema.get(col) else { continue };
+                let Some(schema) = f.grid.schema.get(col) else {
+                    continue;
+                };
                 if !schema.ty.editable() {
                     continue;
                 }
@@ -608,8 +646,7 @@ impl App {
                         applied += 1;
                     }
                     Err(msg) => {
-                        rejected
-                            .get_or_insert_with(|| format!("col '{}': {msg}", schema.name));
+                        rejected.get_or_insert_with(|| format!("col '{}': {msg}", schema.name));
                     }
                 }
             }
@@ -625,7 +662,9 @@ impl App {
     /// `extend` (shift held), only the head moves; otherwise anchor and
     /// head move together. Scrolls the view to the new row.
     pub fn move_selection(&mut self, drow: i64, dcol: i64, extend: bool) {
-        let Some(file) = self.file.as_mut() else { return };
+        let Some(file) = self.file.as_mut() else {
+            return;
+        };
         let total = file.shown_rows.max(file.grid.cache.total());
         if total == 0 {
             return;
@@ -633,14 +672,18 @@ impl App {
         let ncols = file.grid.schema.len() as i64;
         let (row, col, anchor) = match file.selection {
             Some(sel) => {
-                let base = if extend { sel.head } else { sel.head };
+                let base = sel.head;
                 (base.rowid as i64 + drow, base.col as i64 + dcol, sel.anchor)
             }
-            None => (drow.min(0).max(0), dcol.min(0).max(0), Cell { rowid: 0, col: 0 }),
+            None => (0, 0, Cell { rowid: 0, col: 0 }),
         };
         let row = row.clamp(0, total as i64 - 1) as u64;
         let col = col.clamp(0, ncols - 1) as usize;
-        let anchor = if extend { anchor } else { Cell { rowid: row, col } };
+        let anchor = if extend {
+            anchor
+        } else {
+            Cell { rowid: row, col }
+        };
         file.selection = Some(Sel {
             anchor,
             head: Cell { rowid: row, col },
@@ -676,8 +719,7 @@ impl App {
                             f.apply_filter(filter);
                             f.grid.shown_rows = total;
                             f.grid.cache.set_total(total);
-                            self.status =
-                                format!("{} rows match", crate::util::fmt_count(total));
+                            self.status = format!("{} rows match", crate::util::fmt_count(total));
                         } else if epoch == f.grid.cache.epoch() {
                             f.shown_rows = total;
                             f.grid.cache.set_total(total);
@@ -687,9 +729,11 @@ impl App {
                 }
                 JobResult::Rows(batch) => {
                     if let Some(f) = self.file.as_mut() {
-                        f.grid
-                            .cache
-                            .put_page(batch.epoch, batch.start_row / PAGE_SIZE as u64, batch.rows);
+                        f.grid.cache.put_page(
+                            batch.epoch,
+                            batch.start_row / PAGE_SIZE as u64,
+                            batch.rows,
+                        );
                     }
                 }
                 JobResult::Stats(s) => {
@@ -698,18 +742,17 @@ impl App {
                         f.stats.push(s);
                     }
                 }
-                JobResult::TopValues { col, values, truncated } => {
-                    if let Some(f) = self.file.as_mut() {
-                        if let Some(pop) = f.popover.as_mut() {
-                            if pop.col == col {
-                                pop.values = values
-                                    .into_iter()
-                                    .map(|(v, n)| (v.display(), n))
-                                    .collect();
-                                pop.truncated = truncated;
-                                pop.loading = false;
-                            }
-                        }
+                JobResult::TopValues {
+                    col,
+                    values,
+                    truncated,
+                } => {
+                    if let Some(pop) = self.file.as_mut().and_then(|f| f.popover.as_mut())
+                        && pop.col == col
+                    {
+                        pop.values = values.into_iter().map(|(v, n)| (v.display(), n)).collect();
+                        pop.truncated = truncated;
+                        pop.loading = false;
                     }
                 }
                 JobResult::Done { kind, message } => match kind {
@@ -772,7 +815,10 @@ impl App {
 
     fn push_recent(&mut self) {
         let Some(f) = self.file.as_ref() else { return };
-        let entry = Recent { path: f.path.to_string_lossy().into_owned(), rows: f.total_rows };
+        let entry = Recent {
+            path: f.path.to_string_lossy().into_owned(),
+            rows: f.total_rows,
+        };
         self.recents.retain(|r| r.path != entry.path);
         self.recents.insert(0, entry);
         self.recents.truncate(8);
@@ -785,7 +831,6 @@ mod app_tests {
     //! Headless end-to-end tests for App-level flows (real worker).
 
     use super::*;
-    use crate::data::engine::JobResult;
     use crate::data::types::CellValue;
     use std::path::Path;
     use std::time::Duration;

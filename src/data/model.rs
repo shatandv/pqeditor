@@ -15,6 +15,8 @@ pub const PAGE_SIZE: u32 = 2_000;
 /// Keep at most this many pages in memory, then evict least-recently-used.
 const MAX_PAGES: usize = 512;
 
+type PageEntry = (u64, Option<Vec<Vec<CellValue>>>);
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct DisplayCell {
     pub value: CellValue,
@@ -32,7 +34,7 @@ pub struct RowCache {
     epoch: u64,
     total: u64,
     /// page index -> (last used tick, rows or None while fetch failed)
-    pages: HashMap<u64, (u64, Option<Vec<Vec<CellValue>>>)>,
+    pages: HashMap<u64, PageEntry>,
     /// pages asked from the worker, not yet answered
     in_flight: std::collections::HashSet<u64>,
     tick: u64,
@@ -75,12 +77,7 @@ impl RowCache {
     }
 
     /// Store a fetched page. Rejects stale epochs.
-    pub fn put_page(
-        &mut self,
-        epoch: u64,
-        page: u64,
-        rows: Vec<Vec<CellValue>>,
-    ) -> bool {
+    pub fn put_page(&mut self, epoch: u64, page: u64, rows: Vec<Vec<CellValue>>) -> bool {
         if epoch != self.epoch {
             return false;
         }
@@ -101,8 +98,7 @@ impl RowCache {
         if self.pages.len() <= MAX_PAGES {
             return;
         }
-        let mut order: Vec<(u64, u64)> =
-            self.pages.iter().map(|(k, (t, _))| (*k, *t)).collect();
+        let mut order: Vec<(u64, u64)> = self.pages.iter().map(|(k, (t, _))| (*k, *t)).collect();
         order.sort_by_key(|(_, t)| *t);
         let drop_n = self.pages.len() - MAX_PAGES + MAX_PAGES / 10;
         for (k, _) in order.into_iter().take(drop_n) {
@@ -144,7 +140,10 @@ impl Sel {
     pub fn single_full_row(rowid: u64, ncols: usize) -> Self {
         Self {
             anchor: Cell { rowid, col: 0 },
-            head: Cell { rowid, col: ncols.saturating_sub(1) },
+            head: Cell {
+                rowid,
+                col: ncols.saturating_sub(1),
+            },
         }
     }
 
@@ -315,11 +314,7 @@ impl GridState {
     /// The selection rectangle as TSV (Ctrl+C). Missing (unfetched) cells
     /// come out empty; dropped columns are skipped. Returns None for an
     /// empty or oversized selection.
-    pub fn copy_rect(
-        &mut self,
-        sel: &Sel,
-        max_cells: usize,
-    ) -> Option<String> {
+    pub fn copy_rect(&mut self, sel: &Sel, max_cells: usize) -> Option<String> {
         let ncols = self.schema.len();
         let (r0, r1, c0, c1) = sel.rect(self.cache.total(), ncols);
         if r1 < r0 || c1 < c0 {
@@ -343,7 +338,12 @@ impl GridState {
                 if !line.is_empty() {
                     line.push('\t');
                 }
-                line.push_str(&self.cell(r, c).map(|v| v.value.display()).unwrap_or_default());
+                line.push_str(
+                    &self
+                        .cell(r, c)
+                        .map(|v| v.value.display())
+                        .unwrap_or_default(),
+                );
             }
             out.push_str(&line);
             out.push('\n');
@@ -371,7 +371,7 @@ mod tests {
     fn filled_cache() -> RowCache {
         let mut c = RowCache::default();
         c.clear(1, PAGE_SIZE as u64 * 2);
-        let p0: Vec<Vec<CellValue>> = (0..PAGE_SIZE as i64).map(|i| val(i)).collect();
+        let p0: Vec<Vec<CellValue>> = (0..PAGE_SIZE as i64).map(val).collect();
         assert!(c.put_page(1, 0, p0));
         c
     }
@@ -407,13 +407,19 @@ mod tests {
 
     #[test]
     fn overlay_overrides_display() {
-        use crate::data::types::{ColumnSchema, ColType};
+        use crate::data::types::{ColType, ColumnSchema};
         let mut g = GridState::new(vec![
-            ColumnSchema { name: "a".into(), ty: ColType::Integer },
-            ColumnSchema { name: "b".into(), ty: ColType::Text },
+            ColumnSchema {
+                name: "a".into(),
+                ty: ColType::Integer,
+            },
+            ColumnSchema {
+                name: "b".into(),
+                ty: ColType::Text,
+            },
         ]);
         g.cache.clear(1, PAGE_SIZE as u64);
-        let p0: Vec<Vec<CellValue>> = (0..PAGE_SIZE as i64).map(|i| val(i)).collect();
+        let p0: Vec<Vec<CellValue>> = (0..PAGE_SIZE as i64).map(val).collect();
         assert!(g.cache.put_page(1, 0, p0));
 
         let before = g.cell(5, 0).unwrap();
@@ -430,10 +436,16 @@ mod tests {
 
         // Overlay survives a requery (new epoch): the cache is cleared, but
         // the overlay lookup is unaffected.
-        g.requery(vec![SortKey { col: 0, ascending: false }], None);
+        g.requery(
+            vec![SortKey {
+                col: 0,
+                ascending: false,
+            }],
+            None,
+        );
         assert!(g.overlay.get(5, 0).is_some());
         // And once the page is re-fetched, display still shows the edit.
-        let p0: Vec<Vec<CellValue>> = (0..PAGE_SIZE as i64).map(|i| val(i)).collect();
+        let p0: Vec<Vec<CellValue>> = (0..PAGE_SIZE as i64).map(val).collect();
         assert!(g.cache.put_page(2, 0, p0));
         assert_eq!(g.cell(5, 0).unwrap().value, CellValue::Int(77));
     }
