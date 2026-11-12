@@ -12,7 +12,15 @@ strip = true
 anyhow = "1.0.104"
 csv = "1.4.0"
 duckdb = { version = "1.20000.1", features = ["bundled", "parquet"] }
-eframe = { version = "0.37.0", features = ["persistence", "glow"] }
+eframe = { version = "0.37.0", default-features = false, features = [
+    "accesskit",
+    "clipboard",
+    "default_fonts",
+    "glow",
+    "persistence",
+    "wayland",
+    "x11",
+] }
 egui = "0.37.0"
 egui_extras = "0.37.0"
 rfd = "0.18.0"
