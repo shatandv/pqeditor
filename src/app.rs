@@ -478,7 +478,11 @@ impl App {
                 JobResult::Opened { schema, total } => {
                     let path = self.opening.take().unwrap_or_default();
                     self.status = format!("opened {}", path.display());
-                    self.file = Some(FileState::new(path, schema, total));
+                    let mut file = FileState::new(path, schema, total);
+                    // The grid renders from the cache's total; seed it with
+                    // the real row count right away.
+                    file.grid.cache.set_total(total);
+                    self.file = Some(file);
                     self.push_recent();
                 }
                 JobResult::Count { epoch, total } => {
@@ -488,10 +492,12 @@ impl App {
                             let filter = f.pending_filter.clone();
                             f.apply_filter(filter);
                             f.grid.shown_rows = total;
+                            f.grid.cache.set_total(total);
                             self.status =
                                 format!("{} rows match", crate::util::fmt_count(total));
                         } else if epoch == f.grid.cache.epoch() {
                             f.shown_rows = total;
+                            f.grid.cache.set_total(total);
                             f.count_pending = false;
                         }
                     }

@@ -25,6 +25,9 @@ use egui::Key;
 pub const STORAGE_KEY: &str = "pqeditor/recents";
 
 fn main() {
+    // Optional CLI: open a parquet file at startup.
+    let open_path = std::env::args().nth(1).map(std::path::PathBuf::from);
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("pqeditor")
@@ -36,8 +39,18 @@ fn main() {
         renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
-    eframe::run_native("pqeditor", options, Box::new(|cc| Ok(Box::new(app::App::new(cc)))))
-        .expect("pqeditor crashed");
+    eframe::run_native(
+        "pqeditor",
+        options,
+        Box::new(move |cc| {
+            let mut app = app::App::new(cc);
+            if let Some(path) = open_path {
+                app.open_path(path);
+            }
+            Ok(Box::new(app))
+        }),
+    )
+    .expect("pqeditor crashed");
 }
 
 /// 32x32 RGBA icon: dark square with an amber border. Cheap and in-theme.

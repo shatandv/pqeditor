@@ -46,6 +46,12 @@ impl RowCache {
         self.in_flight.clear();
     }
 
+    /// Update the row count without discarding cached pages (a fresh
+    /// `count(*)` arrived; pagination stays valid).
+    pub fn set_total(&mut self, total: u64) {
+        self.total = total;
+    }
+
     pub fn epoch(&self) -> u64 {
         self.epoch
     }
