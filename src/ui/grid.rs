@@ -271,37 +271,57 @@ fn draw_cell(ui: &mut Ui, file: &mut crate::app::FileState, rowid: u64, col: usi
     let ty = file.grid.schema.get(col).map(|s| s.ty);
     let numeric = matches!(ty, Some(ColType::Integer) | Some(ColType::Float));
 
-    let text = match cell.value {
-        CellValue::Null => RichText::new("·").color(theme::NULL_DOT).size(13.0),
-        ref v => {
-            let mut rt = RichText::new(v.display()).size(13.0);
-            if cell.edited {
-                rt = rt.color(theme::ACCENT_TEXT);
-            }
-            rt
-        }
-    };
+    // The whole cell rect is the click target, not just the text (so NULL
+    // and short values are as easy to hit as wide ones).
+    let rect = ui.available_rect_before_wrap().shrink(1.0);
+    let resp = ui.interact(
+        rect,
+        ui.scope_id().with(("pq-cell", rowid, col)),
+        Sense::click(),
+    );
 
-    let label = Label::new(text).sense(Sense::click());
-    let resp = if numeric {
-        ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-            ui.add(label)
-        })
-        .inner
-    } else {
-        ui.add(label)
-    };
-
+    // Backgrounds: edited marker, selected-cell fill.
     if cell.edited {
-        let rect = ui.max_rect();
         ui.painter().rect_filled(
             egui::Rect::from_min_size(rect.min, egui::vec2(2.0, rect.height())),
             0.0,
             theme::ACCENT,
         );
     }
+    let selected_cell = selected && file.selection.is_some_and(|s| s.col == col);
+    if selected_cell {
+        ui.painter().rect_filled(rect, 0.0, theme::BG_SELECT_CELL);
+    }
+
+    // Text as a real widget (AT-SPI/screen-reader visible), placed into the
+    // exact cell rect; right-aligned for numbers.
+    let text = match cell.value {
+        CellValue::Null => RichText::new("·").color(theme::NULL_DOT).size(13.0),
+        ref v => RichText::new(v.display())
+            .size(13.0)
+            .color(if cell.edited { theme::ACCENT_TEXT } else { theme::TEXT }),
+    };
+    let label = Label::new(text)
+        .sense(Sense::hover())
+        .halign(if numeric { Align::Max } else { Align::Min });
+    ui.put(rect, label);
+    if selected_cell {
+        ui.painter().rect_stroke(
+            rect,
+            0.0,
+            egui::Stroke::new(1.5, theme::ACCENT),
+            egui::StrokeKind::Inside,
+        );
+    }
 
     if resp.clicked() {
+        // Clicking a different cell while an editor is open commits it
+        // (click-away = commit, like Excel).
+        if file.editing.is_some()
+            && !file.editing.as_ref().is_some_and(|e| e.rowid == rowid && e.col == col)
+        {
+            file.commit_editing();
+        }
         file.selection = Some(crate::app::Sel { rowid, col });
     }
     if resp.double_clicked() {
@@ -337,11 +357,13 @@ fn draw_cell(ui: &mut Ui, file: &mut crate::app::FileState, rowid: u64, col: usi
 fn draw_editor(ui: &mut Ui, file: &mut crate::app::FileState) {
     let Some(edit) = file.editing.as_mut() else { return };
     let width = ui.available_width().max(60.0);
-    let editor = TextEdit::singleline(&mut edit.text).desired_width(width);
+    // Stable id: position-derived ids shift as rows scroll, which would
+    // silently discard the edit buffer mid-typing.
+    let editor = TextEdit::singleline(&mut edit.text)
+        .id_salt(("pq-edit", edit.rowid, edit.col))
+        .desired_width(width);
     let resp = ui.add_sized([width, theme::ROW_HEIGHT - 6.0], editor);
     resp.request_focus();
-    // Commit on Enter, cancel on Escape. Losing focus to a click elsewhere
-    // cancels (no accidental commits).
     let focused = resp.has_focus();
     let (enter, esc) = ui
         .input(|i| (i.key_pressed(Key::Enter), i.key_pressed(Key::Escape)));
@@ -350,7 +372,9 @@ fn draw_editor(ui: &mut Ui, file: &mut crate::app::FileState) {
     } else if focused && esc {
         file.editing = None;
     } else if resp.lost_focus() {
-        file.editing = None;
+        // Clicked elsewhere / focus moved: commit like Excel does. A
+        // no-change commit is a no-op; an invalid value keeps the editor.
+        file.commit_editing();
     }
 }
 

@@ -23,13 +23,26 @@ pub enum PanelAction {
     OpenRecent(usize),
 }
 
+/// Debug tracing, enabled with PQEDITOR_DEBUG=1. Goes to stderr; on
+/// Windows launch with stderr redirected (GUI app: no console).
+pub fn dbg(msg: &str) {
+    if std::env::var_os("PQEDITOR_DEBUG").is_some() {
+        eprintln!("pqeditor: {msg}");
+    }
+}
+
 pub fn toolbar(ui: &mut Ui, app: &mut App) -> Vec<PanelAction> {
     let mut actions = Vec::new();
+    dbg("toolbar: enter");
 
     egui::Panel::top("pq-toolbar")
         .exact_size(TOOLBAR_HEIGHT)
         .frame(egui::Frame::NONE.fill(theme::BG_WINDOW).inner_margin(egui::Margin::symmetric(8, 4)))
         .show(ui, |ui| {
+            // Panels default to a top-down layout; the toolbar needs a
+            // horizontal one, or everything after the first button stacks
+            // below the 38px panel edge and gets clipped.
+            ui.horizontal(|ui| {
             let file_open = app.file.is_some();
 
             if ui
@@ -38,14 +51,15 @@ pub fn toolbar(ui: &mut Ui, app: &mut App) -> Vec<PanelAction> {
             {
                 actions.push(PanelAction::Open);
             }
-            if ui
-            .add_enabled(
+            dbg("toolbar: open drawn");
+            let save_resp = ui.add_enabled(
                 file_open,
                 egui::Button::new(
                     RichText::new("Save").color(if app.dirty() { theme::ACCENT_TEXT } else { theme::TEXT_HEADER }),
                 ),
-            )
-            .clicked()
+            );
+            dbg(&format!("toolbar: save drawn rect={:?} visible={}", save_resp.rect, ui.is_rect_visible(save_resp.rect)));
+            if save_resp.clicked()
             {
                 actions.push(PanelAction::Save);
             }
@@ -56,10 +70,12 @@ pub fn toolbar(ui: &mut Ui, app: &mut App) -> Vec<PanelAction> {
                 actions.push(PanelAction::Export);
             }
 
+            dbg("toolbar: export drawn");
             ui.separator();
 
             // Filter box.
             let Some(file) = app.file.as_mut() else {
+                dbg("toolbar: nofile branch");
                 // No file: keep the layout breathing room only.
                 ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                     if ui.small_button("choose a file (Ctrl+O)").clicked() {
@@ -68,6 +84,7 @@ pub fn toolbar(ui: &mut Ui, app: &mut App) -> Vec<PanelAction> {
                 });
                 return;
             };
+            dbg("toolbar: filter box drawing");
             let resp = ui.add_sized(
                 [ui.available_width() - 24.0, 24.0],
                 TextEdit::singleline(&mut file.filter_draft)
@@ -87,6 +104,7 @@ pub fn toolbar(ui: &mut Ui, app: &mut App) -> Vec<PanelAction> {
                 file.filter_draft.clear();
             }
 
+            dbg(&format!("toolbar: filter drawn rect={:?}", resp.rect));
             // Clear filter button.
             let has_filter = file.grid.filter.is_some();
             if ui
@@ -119,6 +137,7 @@ pub fn toolbar(ui: &mut Ui, app: &mut App) -> Vec<PanelAction> {
                 let _ = i;
             }
             // Focus request from Ctrl+L is consumed inside; nothing here.
+            });
         });
     actions
 }

@@ -91,12 +91,12 @@ impl FileState {
             return;
         }
         let text = self.grid.edit_source_text(rowid, col).unwrap_or_default();
-        self.editing = Some(EditState { rowid, col, text });
+        self.editing = Some(EditState { rowid, col, initial: text.clone(), text });
     }
 
     /// Commit the active edit: validate against the column type, store in
-    /// the overlay. On validation failure the editor stays open and the
-    /// error is recorded.
+    /// the overlay. Unchanged text is a no-op. On validation failure the
+    /// editor stays open and the error is recorded.
     pub fn commit_editing(&mut self) {
         self.commit_error = None;
         let Some(edit) = self.editing.clone() else { return };
@@ -104,6 +104,11 @@ impl FileState {
             self.editing = None;
             return;
         };
+        // No change since the editor opened: discard silently.
+        if edit.text.trim() == edit.initial.trim() {
+            self.editing = None;
+            return;
+        }
         match crate::data::types::validate_edit(schema.ty, &edit.text) {
             Ok(val) => {
                 self.grid.overlay.set(edit.rowid, edit.col, val);
@@ -141,6 +146,9 @@ pub struct EditState {
     pub rowid: u64,
     pub col: usize,
     pub text: String,
+    /// What the cell showed when the editor opened; an unchanged commit is
+    /// a no-op (no overlay entry, no unsaved-edit count).
+    pub initial: String,
 }
 
 /// The per-column filter popover.
@@ -189,6 +197,15 @@ pub struct App {
     pub file: Option<FileState>,
     /// Path whose Open job is in flight.
     pub opening: Option<PathBuf>,
+    /// File to open after the user resolves the unsaved-edits confirm.
+    pub pending_open: Option<PathBuf>,
+    /// Active unsaved-changes confirmation, if any.
+    pub confirm: Option<Confirm>,
+    /// Set when the user chose "Save" in a Quit confirm: close once the
+    /// save finishes.
+    pub quit_after_save: bool,
+    /// Main.rs consumes this to send the actual close command.
+    pub close_requested_flag: bool,
     pub recents: Vec<Recent>,
     /// Transient green/neutral status message (bottom bar).
     pub status: String,
@@ -209,6 +226,14 @@ impl App {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Confirm {
+    /// Opening another file while dirty.
+    OpenFile,
+    /// Quitting while dirty.
+    Quit,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Recent {
     pub path: String,
@@ -216,6 +241,25 @@ pub struct Recent {
 }
 
 impl App {
+    /// Shared constructor body (App::new and tests).
+    fn with_engine(engine: Engine, recents: Vec<Recent>) -> Self {
+        Self {
+            engine,
+            file: None,
+            opening: None,
+            pending_open: None,
+            confirm: None,
+            quit_after_save: false,
+            close_requested_flag: false,
+            recents,
+            status: "ready".into(),
+            error: None,
+            saving: false,
+            exporting: false,
+            focus_filter_next: false,
+        }
+    }
+
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         crate::theme::install(&cc.egui_ctx);
         crate::theme::install_fonts(&cc.egui_ctx);
@@ -224,37 +268,31 @@ impl App {
             .and_then(|s| eframe::get_value(s, crate::STORAGE_KEY))
             .unwrap_or_default();
         match Engine::spawn() {
-            Ok(engine) => Self {
-                engine,
-                file: None,
-                opening: None,
-                recents,
-                status: "ready".into(),
-                error: None,
-                saving: false,
-                exporting: false,
-                focus_filter_next: false,
-            },
+            Ok(engine) => Self::with_engine(engine, recents),
             Err(e) => {
                 // App without a worker: show the error and nothing else.
-                Self {
-                    engine: Engine::broken(),
-                    file: None,
-                    opening: None,
-                    recents,
-                    status: format!("duckdb failed to start: {e:#}"),
-                    error: None,
-                    saving: false,
-                    exporting: false,
-                    focus_filter_next: false,
-                }
+                Self::with_engine(Engine::broken(), recents)
+                    .with_status(format!("duckdb failed to start: {e:#}"))
             }
         }
+    }
+
+    fn with_status(mut self, status: String) -> Self {
+        self.status = status;
+        self
     }
 
     // ---- actions ---------------------------------------------------------
 
     pub fn open_path(&mut self, path: PathBuf) {
+        // Unsaved edits: ask before throwing them away.
+        if self.dirty() {
+            self.pending_open = Some(path);
+            if self.confirm.is_none() {
+                self.confirm = Some(Confirm::OpenFile);
+            }
+            return;
+        }
         self.error = None;
         self.status = format!("opening {}", path.display());
         self.file = None;
@@ -366,12 +404,27 @@ impl App {
             return;
         }
         file.apply_filter(None);
+        self.refresh_count();
         self.status = "filter cleared".into();
     }
 
     pub fn cycle_sort(&mut self, col: usize, append: bool) {
         if let Some(f) = self.file.as_mut() {
             f.cycle_sort(col, append);
+        }
+        self.refresh_count();
+    }
+
+    /// After any requery (sort/filter change): the grid reads its row count
+    /// from the cache, which requery resets — so always send a fresh
+    /// `count(*)` for the current filter.
+    pub fn refresh_count(&mut self) {
+        let Some(f) = self.file.as_ref() else { return };
+        let epoch = f.grid.cache.epoch();
+        let filter = f.grid.filter.clone();
+        self.engine.send(Job::Count { epoch, filter });
+        if let Some(f) = self.file.as_mut() {
+            f.count_pending = true;
         }
     }
 
@@ -428,6 +481,7 @@ impl App {
             let sort = f.grid.sort.clone();
             f.grid.requery(sort, fragment.clone());
         }
+        self.refresh_count();
         self.status = match fragment {
             Some(_) => "filter applied".into(),
             None => "filter cleared".into(),
@@ -535,11 +589,17 @@ impl App {
                         if let Some(f) = self.file.as_mut() {
                             f.grid.overlay.clear();
                             f.requery();
-                            let epoch = f.grid.cache.epoch();
-                            let filter = f.grid.filter.clone();
-                            self.engine.send(Job::Count { epoch, filter });
                         }
+                        self.refresh_count();
                         self.status = message;
+                        // Save & continue flows (confirm dialog).
+                        if self.quit_after_save {
+                            self.quit_after_save = false;
+                            self.close_requested_flag = true;
+                        }
+                        if let Some(p) = self.pending_open.take() {
+                            self.open_path(p);
+                        }
                     }
                     JobKind::Export => {
                         self.exporting = false;
@@ -579,5 +639,101 @@ impl App {
         self.recents.insert(0, entry);
         self.recents.truncate(8);
         // Persisted once per frame via eframe storage (see update()).
+    }
+}
+
+#[cfg(test)]
+mod app_tests {
+    //! Headless end-to-end tests for App-level flows (real worker).
+
+    use super::*;
+    use crate::data::engine::JobResult;
+    use crate::data::types::CellValue;
+    use std::path::Path;
+    use std::time::Duration;
+
+    fn tmp(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "pqeditor-app-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn make_parquet(path: &Path, rows: i64) {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "COPY (SELECT i AS id FROM range({rows}) t(i)) TO {}",
+            crate::data::types::sql_quote(&path.to_string_lossy())
+        ))
+        .unwrap();
+    }
+
+    fn drain(app: &mut App) {
+        for _ in 0..50 {
+            app.poll();
+            if app.file.is_some() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("file never opened");
+    }
+
+    #[test]
+    fn sort_and_filter_refresh_grid_row_count() {
+        // Regression: cycle_sort/apply_popover requiered but never sent a
+        // fresh count(*), so the grid rendered zero rows after any sort.
+        let dir = tmp("sort-count");
+        let path = dir.join("t.parquet");
+        make_parquet(&path, 100);
+        let app = &mut App::with_engine(Engine::spawn().unwrap(), Vec::new());
+        app.open_path(path);
+        drain(app);
+        assert_eq!(app.file.as_ref().unwrap().grid.cache.total(), 100);
+
+        app.cycle_sort(0, false);
+        // Count answer must arrive and fill the cache total.
+        for _ in 0..50 {
+            app.poll();
+            if app.file.as_ref().unwrap().grid.cache.total() == 100 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(app.file.as_ref().unwrap().grid.cache.total(), 100);
+    }
+
+    #[test]
+    fn unchanged_edit_is_a_noop() {
+        let dir = tmp("noop-edit");
+        let path = dir.join("t.parquet");
+        make_parquet(&path, 10);
+        let app = &mut App::with_engine(Engine::spawn().unwrap(), Vec::new());
+        app.open_path(path);
+        drain(app);
+
+        let f = app.file.as_mut().unwrap();
+        f.grid.cache.clear(1, 10);
+        let rows: Vec<Vec<CellValue>> = (0..10).map(|i| vec![CellValue::Int(i)]).collect();
+        assert!(f.grid.cache.put_page(1, 0, rows));
+
+        f.selection = Some(Sel { rowid: 3, col: 0 });
+        f.begin_edit_at(3, 0);
+        // Commit without touching the text: no overlay entry.
+        f.commit_editing();
+        assert!(f.editing.is_none());
+        assert!(f.grid.overlay.is_empty());
+
+        // Changing the text does produce an edit.
+        f.begin_edit_at(3, 0);
+        f.editing.as_mut().unwrap().text = "42".into();
+        f.commit_editing();
+        assert_eq!(f.grid.overlay.len(), 1);
     }
 }

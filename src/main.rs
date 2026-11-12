@@ -92,6 +92,24 @@ impl eframe::App for app::App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
 
+        // Unsaved-edits guard for the window close button: cancel the close
+        // and ask. A deliberate close (confirm dialog said discard) is not
+        // cancelled again.
+        let close_requested = ctx.input(|i| i.viewport().close_requested());
+        if close_requested
+            && self.dirty()
+            && !self.close_requested_flag
+            && self.confirm != Some(app::Confirm::Quit)
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.confirm = Some(app::Confirm::Quit);
+            self.pending_open = None;
+        }
+        if self.close_requested_flag {
+            self.close_requested_flag = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+
         // Files dragged onto the window (start screen and grid alike).
         let dropped: Vec<_> = ui.input(|i| i.raw.dropped_files.clone());
         if let Some(f) = dropped.iter().find(|f| f.path() != std::path::Path::new("")) {

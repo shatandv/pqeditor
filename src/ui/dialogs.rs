@@ -14,10 +14,80 @@ use crate::theme;
 /// keyboard shortcuts should not fire this frame).
 pub fn draw(ctx: &egui::Context, app: &mut App) -> bool {
     let mut captured = false;
+    captured |= confirm_dialog(ctx, app);
     captured |= filter_popover(ctx, app);
     captured |= export_dialog(ctx, app);
     captured |= goto_row_dialog(ctx, app);
     captured
+}
+
+/// Unsaved-changes confirmation (opening another file or quitting).
+fn confirm_dialog(ctx: &egui::Context, app: &mut App) -> bool {
+    let Some(confirm) = app.confirm else { return false };
+    let mut action: Option<u8> = None; // 0 = save, 1 = discard, 2 = cancel
+
+    egui::Modal::new(egui::Id::new("pq-confirm")).show(ctx, |ui| {
+        ui.label(RichText::new("Unsaved changes").color(theme::TEXT_HEADER).size(14.0));
+        ui.add_space(4.0);
+        ui.label(RichText::new(match confirm {
+            crate::app::Confirm::OpenFile =>
+                "Opening another file will discard the unsaved edits.",
+            crate::app::Confirm::Quit =>
+                "Quit and discard the unsaved edits?",
+        }).color(theme::TEXT));
+        ui.add_space(10.0);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .add(egui::Button::new(RichText::new("Save").color(theme::ACCENT_TEXT)))
+                .clicked()
+            {
+                action = Some(0);
+            }
+            if ui.button("discard").clicked() {
+                action = Some(1);
+            }
+            if ui.button("cancel").clicked() {
+                action = Some(2);
+            }
+        });
+    });
+
+    match action {
+        Some(0) => {
+            // Save first; the pending open / quit continues after the save
+            // job finishes.
+            if matches!(confirm, crate::app::Confirm::Quit) {
+                app.quit_after_save = true;
+            }
+            app.confirm = None;
+            app.save();
+        }
+        Some(1) => {
+            if let Some(f) = app.file.as_mut() {
+                f.grid.overlay.clear();
+                f.editing = None;
+            }
+            match confirm {
+                crate::app::Confirm::OpenFile => {
+                    app.confirm = None;
+                    if let Some(p) = app.pending_open.take() {
+                        app.open_path(p);
+                    }
+                }
+                crate::app::Confirm::Quit => {
+                    app.confirm = None;
+                    app.close_requested_flag = true;
+                }
+            }
+        }
+        Some(_) => {
+            // Cancel: stay in the current file.
+            app.confirm = None;
+            app.pending_open = None;
+        }
+        None => {}
+    }
+    app.confirm.is_some()
 }
 
 fn filter_popover(ctx: &egui::Context, app: &mut App) -> bool {

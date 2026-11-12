@@ -19,6 +19,8 @@ pub const BG_STATUS: Color32 = Color32::from_rgb(0x12, 0x14, 0x1a);
 pub const BG_HOVER: Color32 = Color32::from_rgb(0x1f, 0x23, 0x2b);
 /// Row selection.
 pub const BG_SELECT: Color32 = Color32::from_rgb(0x2b, 0x3a, 0x55);
+/// The one selected cell, brighter than the row tint.
+pub const BG_SELECT_CELL: Color32 = Color32::from_rgb(0x38, 0x4d, 0x6e);
 /// Inline editor background.
 pub const BG_EDITOR: Color32 = Color32::from_rgb(0x10, 0x13, 0x1a);
 /// Hairlines: cell borders.
