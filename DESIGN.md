@@ -1,103 +1,194 @@
-# pqeditor design
+# pqeditor — System Design
 
-Agreed design (Nov 2026). This is the source of truth for UX decisions;
-`mockup.html` is the visual reference and `src/theme.rs` implements its
-palette in egui.
+The product contract, the component map, and the sync contracts that keep
+the UI correct. Every rule here is enforced either by the test battery or
+by the pre-push hook. This document is the arbiter when a fix would fight
+the structure: change the structure or change the fix, not the rule.
 
-## Stack
+## 1. Product requirements (accumulated, verbatim-intent)
 
-Rust + eframe/egui 0.37 + egui_extras + DuckDB (bundled, via the `duckdb`
-crate) + rfd (file dialogs) + rust_xlsxwriter + csv. Chosen so the output
-is a single self-contained binary per platform, no runtime, no installer.
+File handling
+- R1 Open a parquet file (dialog, CLI arg, drag-drop, recents). Anything
+  that is not readable parquet is rejected with a short, presentable
+  error.
+- R2 10M+ rows must open and scroll smoothly. The UI thread never blocks
+  on the file.
+- R3 Export the current view to CSV (BOM, delimiter choice) and XLSX
+  (bold frozen header, autofilter, autofit, typed cells).
 
-## Interface
+Editing
+- R4 Edit a cell in place (double-click, Enter, F2, context menu). Values
+  validate against the column type; a rejected editor stays open with a
+  visible error; an unchanged commit is a no-op.
+- R5 Enter starts editing; Enter commits; Escape cancels; click-away
+  commits. The editor must not self-commit in its creation frame.
+- R6 Rect selection: click selects, shift+click extends, drag selects,
+  arrow keys move, shift+arrows extend, row-number click selects the
+  whole row, header menu selects a column.
+- R7 Copy (Ctrl+C) = TSV of the selection; Paste (Ctrl+V) fills at the
+  anchor; a single value fills the whole selection. Paste is
+  all-or-nothing on validation.
+- R8 Delete on a row selection deletes those rows; on cells sets NULL.
+- R9 Drop a column (header menu). Dropped columns are hidden client-side
+  and excluded from save.
 
-Five zones, no tabs, no sidebars:
+Sorting / filtering
+- R10 Sort by clicking a header (asc → desc → off cycle, shift appends);
+  RMB menu sorts asc/desc; sort chips in the toolbar.
+- R11 SQL WHERE filter box: validated by running it (Count) before
+  applying; errors are short and keep the previous filter. Submitting an
+  empty box clears the filter.
+- R12 Per-column value popover (top values, check to filter).
 
-1. Title bar: OS-native, shows `pqeditor · filename.parquet`.
-2. Toolbar: Open, Save, Export, filter box (SQL WHERE fragment), clear
-   button, sort chips (one per sort key, click to remove).
-3. Grid: row-number column (original rowid, always meaningful), columns
-   with sort arrows and multi-sort order badges. Numbers right-aligned.
-   Nulls render as a dim `·` (never blank). Edited cells: amber left-edge
-   bar + amber text.
-4. Stats strip: one line per requested column, closable, filled
-   asynchronously.
-5. Status bar: total rows, shown rows (when filtered), unsaved edits
-   (amber when nonzero), saving/exporting progress, errors in red.
+Save
+- R13 Ctrl+S saves atomically (tmp + rename). After a plain save the
+  view is unchanged on screen (no reload, no flicker); after a save with
+  dropped columns the schema refreshes and sort/filter carry over.
+- R14 Unsaved-changes confirmation on quit and on switching files.
 
-## Main flows
+Status / feedback
+- R15 Status bar: total rows, filtered "shown" count, unsaved-edit
+  count, transient status/errors. The shown count always matches the
+  active filter.
+- R16 Column statistics strip; true file rowids in the row-number column
+  (stable under sort).
 
-- Open: drag-and-drop (primary), Ctrl+O, file dialog, recents list on the
-  start screen. Opening is instant (a view definition, not a load).
-- Browse: scroll freely through all rows; pages of 2000 rows are fetched
-  around the viewport.
-- Sort: click header cycles asc -> desc -> off (replaces the stack);
-  shift+click appends a secondary key; order badges 1..n on headers.
-- Filter:
-  - SQL mode: type a WHERE fragment in the box, Enter applies. Validated
-    by a `count(*)` probe first; errors show in red and keep the previous
-    filter.
-  - Popover mode: header right-click -> "filter values": searchable list
-    of top-200 distinct values with counts, checkboxes (multi-select),
-    plus an explicit null checkbox.
-- Edit: double-click or F2. Enter commits, Esc cancels, focus-loss
-  cancels (no accidental commits), Ctrl+Delete = explicit NULL. Empty
-  input = NULL. Values are validated against the column type at commit
-  time; invalid input is rejected with a red status message.
-- Save (Ctrl+S): overlay spliced into a full rewrite; writes
-  `<file>.parquet.tmp` then renames over the original. Original row order
-  is preserved. After save the overlay clears.
-- Stats: header right-click -> "column statistics". Numeric columns get
-  count/nulls/distinct/min/max/avg/stddev; text columns get top values
-  with counts.
-- Export (Ctrl+E): dialog with scope (filtered/all), format (csv/xlsx),
-  csv delimiter (`;` default, also `,` tab `|`), destination path. CSV is
-  UTF-8 with BOM (Windows Excel compatibility), `;` avoids Excel's
-  list-separator quirk. XLSX: bold + frozen header row, autofilter,
-  column widths computed from content (autofit), typed cells (numbers as
-  numbers, dates as dates), hard-capped at Excel's 1,048,576 rows with a
-  warning. Exports run in the background with progress in the status bar.
+Non-negotiable invariants (see AGENTS.md — unchanged)
+- The UI thread never touches DuckDB; everything crossing the worker
+  boundary is plain data; edits key off true `__rowid`; row requests
+  carry an epoch; SQL is quoted; saves are atomic.
 
-## Keyboard map
+## 2. Components
 
-- Ctrl+O open, Ctrl+S save, Ctrl+E export, Ctrl+L focus filter box,
-  Ctrl+G go-to-row
-- Arrows / PgUp / PgDn / Home / End move the selection (file order)
-- F2 or Enter: edit cell; Ctrl+Delete: set NULL; Ctrl+C: copy cell
-- Esc closes, in priority order: popover -> go-to-row -> stats -> cell
-  editor -> clears selection
+```
+┌────────────────────────────────────────────────────────────┐
+│ main.rs        eframe entry, global keys, panel composition │
+├────────────────────────────────────────────────────────────┤
+│ ui/*           RENDER ONLY: reads state, calls Commands      │
+│   grid.rs       table (delegates all pointer logic)          │
+│   panels.rs     toolbar, stats, status, start screen         │
+│   dialogs.rs    confirm, filter popover, export, goto        │
+├────────────────────────────────────────────────────────────┤
+│ app.rs         App: Command layer + result application       │
+│   App           owns Engine + FileState + flows              │
+│   FileState     one open file: view state + model            │
+│   interaction   pointer_on_cell/release/click_cell/...       │
+│   state machine (the ONLY writers of selection/drag/edit)    │
+├────────────────────────────────────────────────────────────┤
+│ data/model.rs  GridState: schema, sort, filter, cache,       │
+│                overlay, shown_rows (pure data + pure fns)    │
+│ data/engine.rs worker thread: DuckDB, Job protocol           │
+│ data/types.rs  CellValue/EditValue, validation, SQL quoting  │
+└────────────────────────────────────────────────────────────┘
+```
 
-## Data model decisions (hard to retrofit; agreed deliberately)
+Layer rules:
+1. `ui/*` never mutates state directly except through `FileState`/`App`
+   command methods. Deferred events (HeaderEvent) exist only because
+   egui table closures cannot borrow the app; they map 1:1 to commands.
+2. `data/model.rs` holds no egui types and no I/O; it is fully
+   deterministic and unit-tested.
+3. `app.rs` owns ALL effectful decisions: what to send to the worker and
+   how to apply each worker result. This is the single file allowed to
+   know about the job protocol's lifecycle.
 
-- No in-place patching: save always rewrites the whole file. DuckDB
-  cannot UPDATE parquet in place; atomic full rewrite is simpler and
-  safe. Seconds for 10M rows.
-- `__rowid = row_number() OVER () - 1` over the file is the stable row
-  key. All edits key off it; sorting/filtering are just query
-  decorations.
-- One file open at a time (v1). No undo beyond "close without saving";
-  the overlay is the single pending-change surface.
-- Filter fragments are raw SQL (DBeaver-style), not a builder. Popover
-  filters generate `col IN (...) OR col IS NULL` fragments.
-- Row fetches are synchronous paged queries on the worker thread; the UI
-  shows placeholders for unfetched rows instead of blocking.
+## 3. View-state ownership (the part that went ad-hoc)
 
-## Known limitations (v1, accepted)
+One owner per piece of state; nothing duplicated:
 
-- Navigation keys move in file order, not visual order under sort/filter.
-- List/struct/map columns render as text and are read-only.
-- Save-As is not implemented (Save always writes the open file).
-- The "close with unsaved edits" prompt is not wired to the window close
-  button yet.
-- Row-number column scrolls away with horizontal scrolling.
-- CSV/XLSX export streams through Rust rather than a DuckDB COPY for CSV
-  (BOM + delimiter control), so it is slower than raw COPY but bounded.
+| State | Owner | Notes |
+|---|---|---|
+| schema, sort, filter, cache, overlay, shown_rows | `GridState` | the model |
+| selection, drag_select | `FileState` | written only by the interaction state machine |
+| editing (pos/rowid/text/initial/had_focus/created_frame) | `FileState` | written by begin/commit/cancel |
+| scroll request (`ScrollRequest`) | `FileState` | enum: Center/Edge, never a bare row |
+| visible_rows (last rendered range) | `FileState` | written by grid draw each frame |
+| filter draft / pending validation | `FileState` | applied filter lives in GridState.filter |
+| total_rows (file size) | `FileState` | set once at Open, unchanged by filters |
+| count_pending | `FileState` | one count in flight per epoch |
+| total_rows vs shown_rows | NEVER duplicated | shown lives only in GridState |
 
-## Roadmap candidates (in rough priority)
+Scroll semantics (R2, R-fix from feedback): single steps scroll only
+when the selection leaves the visible area, by one row; jumps center;
+animation off; two pages prefetched.
 
-- Close-with-unsaved-edits prompt (window close button)
-- Visual-order navigation under sort/filter (ordered rowid pages)
-- Save As / export selected rows only
-- Multiple tabs / files
-- Undo stack for the overlay
+## 4. Worker protocol and the view-sync contract
+
+Jobs: Open, Count, Rows, Stats, TopValues, SetDeletedRows, Save, Export.
+Every result carries its epoch (Count/Rows) or completes a flow.
+
+The contract for applying results (implemented in `App::poll`):
+
+- `Opened` → build FileState, seed cache total, apply `reopen_carry`
+  (sort/filter) if this Open came from a save-with-schema-change.
+- `Count` → if a filter candidate is pending: apply it; else (epoch
+  match) update shown_rows + cache total. Stale epochs are dropped.
+- `Rows` → put page (epoch-checked). Pages hold `(rowid, cells)`;
+  addressing is by view position, rowids resolve overlay/save keys.
+- `Done{Save}` → classified by the save outcome (see §5):
+  - Plain: patch fetched pages with the saved values (no reload).
+  - RowsChanged: reset the worker's deleted-rows filter (rowids of
+    survivors are unchanged; positions and pages stay valid).
+  - SchemaChanged: re-open, carrying sort/filter.
+- `Failed{Filter}` → pending_filter cleared, error surfaced, previous
+  filter intact.
+
+## 5. The save flow (one state machine, no ad-hoc branches)
+
+Classification happens when the job is SENT, not when it completes:
+
+```
+SaveOutcome { Plain, RowsChanged, SchemaChanged }
+  SchemaChanged  iff overlay.deleted_cols non-empty
+  RowsChanged    else iff overlay.deleted_rows non-empty
+  Plain          otherwise
+```
+
+- `App::save()` computes and stores the outcome + the edit snapshot.
+- `Done{Save}` consumes the stored outcome. No re-derivation from
+  half-cleared state. This killed the flicker class of bugs.
+- Rowids are stable across a plain save; positions are stable unless
+  rows were deleted; the schema only changes with dropped columns.
+
+## 6. Interaction state machine (all pointer semantics)
+
+The grid draw closures call and the headless tests drive the same
+methods — one source of truth for "what a click does":
+
+- `pointer_on_cell(pos, col, shift)` — press starts a drag-select
+  (collapsing the selection) or extends the rect while held.
+- `pointer_release()` — any release ends a drag (a drag's release never
+  lands as `clicked()` on the release cell).
+- `click_cell(pos, col)` — click-away commits an open editor.
+- `double_click_cell(pos, col)` — selection + begin edit.
+- `secondary_click_cell(pos, col)` — selection for the context menu.
+- `click_rownum(pos, shift)` — whole-row select / extend.
+
+Labels are never selectable (selectable text swallowed clicks in three
+different places — pinned by history). The cell editor ignores its
+creation frame's Enter and commits on click-away only after it held
+focus (`had_focus`).
+
+## 7. Deterministic verification
+
+- `cargo test` (34+ tests) runs on every push via `.githooks/pre-push`
+  (fmt, clippy -D warnings, full battery). Headless App tests drive the
+  REAL worker through the same command methods the UI uses.
+- Scenario tests cover the user-visible flows end-to-end: open → sort →
+  edit under sort → save (view state survives) → paste all-or-nothing →
+  delete rows / drop columns → save round-trips verified on disk with a
+  fresh DuckDB connection.
+- Manual per-round pass: the Wine + nested-Xwayland + XTEST harness
+  (AGENTS.md §verification tooling) — pixel grabs after each step,
+  like-a-human clicking. Required before any exe ships to the user.
+
+## 8. Known open items
+
+- Modal surfaces (export dialog, confirm, context menus) render black
+  under wine+glow here: environment artifact; verify on real Windows.
+  Their logic is exercised headlessly.
+- Wine keyboard focus is flaky in the harness; always verify a key took
+  effect before trusting a keyboard-driven step.
+- Per-job worker timing goes to stderr (diagnostics); make it a status
+  bar readout if open-speed questions recur.
+- Undo/redo, multi-file tabs: not designed yet, do not bolt on.

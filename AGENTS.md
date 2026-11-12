@@ -84,7 +84,57 @@ mockup.html      visual spec of the UI (open in a browser)
 4. Bad filter input: red error, previous filter intact.
 5. Edit rejected for type mismatch: editor stays open, red message.
 
-## MORNING CHECKLIST (Nov 14, from the overnight Wine session — verify, then fix)
+## MORNING RUNBOOK (2026-11-13, execute after 09:00 UTC+3 — no heavy CPU
+## was run overnight; everything below needs the compile-verify cycle)
+
+STATE AT SLEEP:
+- All fixes through "save rework" are COMMITTED AND PUSHED (138e5a5):
+  interaction state machine, save/paste/scroll fixes, panic hook, build
+  stamp, timing logs. dist/ had the build they tested (md5 c3c7b3d6).
+- UNCOMMITTED, REVIEWED-BY-READING ONLY (no compile overnight): the
+  SaveOutcome/PendingSave rework per DESIGN.md §5 — save() classifies
+  Plain/RowsChanged/SchemaChanged at send time and snapshots the
+  sort/filter carry for SchemaChanged; Done{Save} consumes it; Opened
+  consumes pending_save (prevents a stale carry leaking to a later
+  open). DESIGN.md added (requirements inventory + component contracts
+  + sync contracts).
+- The user wants: design-first refactor continued, all issues gone,
+  deterministic checks committed and gating every push, a like-a-human
+  Wine pass per round, and a WORKING exe in dist/ in the morning.
+
+RUNBOOK (in order):
+1. cargo fmt && cargo check --all-targets && cargo clippy
+   --all-targets -- -D warnings && cargo test  (fix what the compiler
+   finds; the SaveOutcome rework compiled zero times so far).
+2. Commit the SaveOutcome rework once green ("save flow per DESIGN.md
+   §5"). Push only after the hook passes.
+3. Refactor slices per DESIGN.md, one commit each, battery green
+   between slices:
+   a. Filter state: move draft/pending/error handling into one
+      FileState block (it is already single-owner; just group the
+      methods and pin with the existing filter tests).
+   b. Scenario tests to add: save_with_deleted_rows (RowsChanged arm:
+      overlay cleared, SetDeletedRows sent, count correct), then
+      save_with_dropped_col (SchemaChanged arm: reopen, sort carried,
+      schema len correct on disk).
+   c. The driver mode (DESIGN §7/AGENTS item B) is OPTIONAL — the
+      headless scenario tests cover most of it; only build it if time
+      remains.
+4. Wine + XTEST like-a-human pass on the REAL exe (build first,
+   COPY TO dist/ AND VERIFY THE HASH — this bit twice now):
+   open -> sort asc/desc/cycle -> edit under sort (Enter) -> commit ->
+   save (expect NO flicker, values correct, sort intact) -> copy 2x2 ->
+   paste -> delete row (rownum+Del) -> save -> drop column (RMB) ->
+   save (re-open + sort carried) -> filter box (shown count, empty
+   clear) -> export dialog (width) -> recents. Grab pixels per step.
+   ALSO verify the save-reopen path can't stall like it did overnight
+   (status transitions saving -> saved -> opened; the panic hook now
+   logs to dist/pqeditor-panic.log if the worker dies).
+5. Refresh dist/, report with the new md5 + size + build stamp.
+
+CONSTRAINTS: no uncapped builds ever (machine froze once at 16-way);
+.cargo/config.toml caps at 2 jobs. The user sleeps near the box until
+09:00 UTC+3 — keep builds short and tell them what ran.
 USER REPORT (stale exe): the user tested dist/pqeditor.exe from Nov 12
 23:34 which predated the Enter/header/drag/clipboard/sort-count fixes —
 every reported symptom matches the pre-fix behavior. dist/ has since

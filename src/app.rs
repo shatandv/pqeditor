@@ -356,17 +356,37 @@ pub struct ExportDialog {
     pub path: String,
 }
 
+/// Classification of an in-flight save, decided when the job is SENT
+/// (never re-derived from half-cleared state at completion).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SaveOutcome {
+    /// Only cell edits: display is patched in place, no reload.
+    Plain,
+    /// Rows were deleted: the worker's view filter is reset (survivor
+    /// rowids are unchanged, positions and pages stay valid).
+    RowsChanged,
+    /// Columns were dropped: the on-disk schema changed, the file is
+    /// re-opened and the view (sort/filter) carries over.
+    SchemaChanged,
+}
+
+/// Everything Done{Save} needs to apply a finished save.
+#[derive(Debug, Clone)]
+pub struct PendingSave {
+    pub outcome: SaveOutcome,
+    /// The edits that were applied, for page patching (Plain).
+    pub edits: Vec<(u64, usize, EditValue)>,
+    /// Sort/filter to restore after the re-open (SchemaChanged).
+    pub carry: Option<(Vec<SortKey>, Option<String>)>,
+}
+
 pub struct App {
     pub engine: Engine,
     pub file: Option<FileState>,
     /// Path whose Open job is in flight.
     pub opening: Option<PathBuf>,
-    /// Sort/filter to restore on the next Opened (save-with-drops re-open
-    /// carries the view over).
-    pub reopen_carry: Option<(Vec<SortKey>, Option<String>)>,
-    /// Edits sent with the in-flight save; Done{Save} patches the fetched
-    /// pages with them so the display matches the file without a refetch.
-    pub last_saved_edits: Option<Vec<(u64, usize, EditValue)>>,
+    /// Everything the completion of the in-flight save needs.
+    pub pending_save: Option<PendingSave>,
     /// File to open after the user resolves the unsaved-edits confirm.
     pub pending_open: Option<PathBuf>,
     /// Active unsaved-changes confirmation, if any.
@@ -417,8 +437,7 @@ impl App {
             engine,
             file: None,
             opening: None,
-            reopen_carry: None,
-            last_saved_edits: None,
+            pending_save: None,
             pending_open: None,
             confirm: None,
             quit_after_save: false,
@@ -496,11 +515,28 @@ impl App {
             .map(|(r, c, v)| (r, c, v.clone()))
             .collect();
         let drop_cols: Vec<usize> = file.grid.overlay.deleted_cols.iter().copied().collect();
+        let outcome = if !drop_cols.is_empty() {
+            SaveOutcome::SchemaChanged
+        } else if !file.grid.overlay.deleted_rows.is_empty() {
+            SaveOutcome::RowsChanged
+        } else {
+            SaveOutcome::Plain
+        };
         self.saving = true;
         self.status = "saving\u{2026}".into();
-        // Kept so Done{Save} can patch the fetched pages in place (no
-        // flicker, display matches the saved file immediately).
-        self.last_saved_edits = Some(overlay.clone());
+        // For SchemaChanged the view is snapshotted NOW: the re-open will
+        // restore exactly this sort/filter (the worker is FIFO, so the
+        // re-open's Opened is the next one to arrive).
+        let carry = if outcome == SaveOutcome::SchemaChanged {
+            Some((file.grid.sort.clone(), file.grid.filter.clone()))
+        } else {
+            None
+        };
+        self.pending_save = Some(PendingSave {
+            outcome,
+            edits: overlay.clone(),
+            carry,
+        });
         self.engine.send(Job::Save {
             overlay,
             drop_cols,
@@ -882,7 +918,10 @@ impl App {
                     file.grid.cache.set_total(total);
                     // A save-with-drops re-open carries the view over so
                     // the grid doesn't jump back to unsorted file order.
-                    if let Some((sort, filter)) = self.reopen_carry.take() {
+                    // Consumed here: later opens must not inherit it.
+                    if let Some((sort, filter)) =
+                        self.pending_save.take().and_then(|p| p.carry)
+                    {
                         file.grid.requery(sort, filter);
                     }
                     self.file = Some(file);
@@ -936,16 +975,9 @@ impl App {
                 JobResult::Done { kind, message } => match kind {
                     JobKind::Save => {
                         self.saving = false;
-                        // Whether the schema changed (columns dropped):
-                        // only then does the file need re-opening.
-                        let dropped_cols = self
-                            .file
-                            .as_ref()
-                            .is_some_and(|f| !f.grid.overlay.deleted_cols.is_empty());
-                        let had_deleted_rows = self
-                            .file
-                            .as_ref()
-                            .is_some_and(|f| !f.grid.overlay.deleted_rows.is_empty());
+                        // The classification was made when the job was
+                        // sent; the overlay is already cleared here.
+                        let pending = self.pending_save.take();
                         if let Some(f) = self.file.as_mut() {
                             f.grid.overlay.clear();
                             f.editing = None;
@@ -954,33 +986,36 @@ impl App {
                             // shows (dropped columns were already hidden).
                         }
                         self.status = message.clone();
-                        if had_deleted_rows {
-                            // The saved file no longer contains those rows;
-                            // clear the worker's view filter. Rowids of the
-                            // surviving rows are unchanged, so the fetched
-                            // pages stay valid.
-                            self.engine.send(Job::SetDeletedRows { rows: vec![] });
-                        } else if !dropped_cols {
-                            // Plain save: write the saved values into the
-                            // fetched pages so the display matches the file
-                            // with zero flicker.
-                            let edits = self.last_saved_edits.take().unwrap_or_default();
-                            if let Some(f) = self.file.as_mut() {
-                                f.grid.patch_saved_edits(&edits);
+                        match pending.as_ref().map(|p| p.outcome) {
+                            Some(SaveOutcome::Plain) => {
+                                // Write the saved values into the fetched
+                                // pages so the display matches the file
+                                // with zero flicker.
+                                if let Some(f) = self.file.as_mut() {
+                                    f.grid.patch_saved_edits(
+                                        &pending.map(|p| p.edits).unwrap_or_default(),
+                                    );
+                                }
                             }
-                        }
-                        if dropped_cols {
-                            // Re-open: the on-disk schema changed. Carry the
-                            // sort/filter over so the view survives.
-                            self.reopen_carry = self
-                                .file
-                                .as_ref()
-                                .map(|f| (f.grid.sort.clone(), f.grid.filter.clone()));
-                            if let Some(f) = self.file.as_ref() {
-                                let path = f.path.clone();
-                                self.opening = Some(path.clone());
-                                self.engine.send(Job::Open { path });
+                            Some(SaveOutcome::RowsChanged) => {
+                                // The saved file no longer contains the
+                                // deleted rows; clear the worker's view
+                                // filter. Rowids of the surviving rows are
+                                // unchanged, so pages stay valid.
+                                self.engine
+                                    .send(Job::SetDeletedRows { rows: vec![] });
                             }
+                            Some(SaveOutcome::SchemaChanged) => {
+                                // The on-disk schema changed: re-open.
+                                // pending_save (with its carry snapshot)
+                                // stays until the Opened reply consumes it.
+                                if let Some(f) = self.file.as_ref() {
+                                    let path = f.path.clone();
+                                    self.opening = Some(path.clone());
+                                    self.engine.send(Job::Open { path });
+                                }
+                            }
+                            None => {}
                         }
                         // Save & continue flows (confirm dialog).
                         if self.quit_after_save {
