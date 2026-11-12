@@ -262,16 +262,17 @@ impl app::App {
         } else if ctrl && del {
             self.set_cell_null();
         } else if ctrl && c {
-            self.copy_selection(&ctx);
+            self.copy_selection();
         } else if ctrl && ctx.input(|i| i.key_pressed(Key::V)) {
-            // egui delivers clipboard text as a Paste event.
-            if let Some(text) = ctx.input(|i| {
-                i.raw.events.iter().find_map(|e| match e {
-                    egui::Event::Paste(t) => Some(t.clone()),
-                    _ => None,
-                })
-            }) {
-                self.paste_tsv(&text);
+            // The OS clipboard is read directly (arboard): egui's Paste
+            // event is unreliable across platforms.
+            match clipboard_text() {
+                Ok(text) => {
+                    if !text.is_empty() {
+                        self.paste_tsv(&text);
+                    }
+                }
+                Err(e) => self.error = Some(format!("clipboard: {e}")),
             }
         }
 
@@ -294,14 +295,33 @@ impl app::App {
         }
     }
 
-    fn copy_selection(&mut self, ctx: &egui::Context) {
-        if let Some(f) = self.file.as_mut()
-            && let Some(sel) = f.selection
-            && let Some(text) = f.grid.copy_rect(&sel, 1_000_000)
-        {
-            ctx.copy_text(text);
+    fn copy_selection(&mut self) {
+        let text = self.file.as_mut().and_then(|f| {
+            f.selection
+                .as_ref()
+                .and_then(|sel| f.grid.copy_rect(sel, 1_000_000))
+        });
+        if let Some(text) = text {
+            match set_clipboard_text(&text) {
+                Ok(()) => self.status = "copied".into(),
+                Err(e) => self.error = Some(format!("clipboard: {e}")),
+            }
         }
     }
+}
+
+/// Read the OS clipboard via arboard (works on Windows/Linux/macOS).
+fn clipboard_text() -> Result<String, String> {
+    arboard::Clipboard::new()
+        .and_then(|mut c| c.get_text())
+        .map_err(|e| e.to_string())
+}
+
+/// Write the OS clipboard via arboard.
+fn set_clipboard_text(text: &str) -> Result<(), String> {
+    arboard::Clipboard::new()
+        .and_then(|mut c| c.set_text(text.to_string()))
+        .map_err(|e| e.to_string())
 }
 
 impl app::App {

@@ -2921,6 +2921,7 @@ name = "pqeditor"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arboard",
  "csv",
  "duckdb",
  "eframe",

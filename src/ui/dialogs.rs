@@ -254,7 +254,11 @@ fn export_dialog(ctx: &egui::Context, app: &mut App) -> bool {
     let mut browse = false;
     let mut submit = false;
 
+    // Fixed width: the path TextEdit must not push the modal wider every
+    // frame (runaway auto-sizing on any input). Modal sizes to content, so
+    // pin the content width.
     egui::Modal::new(egui::Id::new("pq-export")).show(ctx, |ui| {
+        ui.set_width(480.0);
         ui.label(RichText::new("Export").color(theme::TEXT_HEADER).size(14.0));
         ui.add_space(4.0);
 
@@ -302,7 +306,7 @@ fn export_dialog(ctx: &egui::Context, app: &mut App) -> bool {
         ui.horizontal(|ui| {
             ui.add_sized(
                 [ui.available_width() - 80.0, 22.0],
-                TextEdit::singleline(&mut dialog.path).desired_width(f32::INFINITY),
+                TextEdit::singleline(&mut dialog.path),
             );
             if ui.button("browse\u{2026}").clicked() {
                 browse = true;
@@ -372,7 +376,7 @@ fn goto_row_dialog(ctx: &egui::Context, app: &mut App) -> bool {
     let Some(draft) = app.file.as_ref().and_then(|f| f.goto_row.clone()) else {
         return false;
     };
-    let total = app.file.as_ref().map(|f| f.shown_rows).unwrap_or(0);
+    let total = app.file.as_ref().map(|f| f.grid.shown_rows).unwrap_or(0);
     let mut go: Option<u64> = None;
     let mut draft = draft;
 

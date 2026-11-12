@@ -274,7 +274,7 @@ pub fn status_bar(ui: &mut Ui, app: &mut App) {
                 let (rows, shown, edits, busy) = match app.file.as_ref() {
                     Some(f) => (
                         f.total_rows,
-                        f.shown_rows,
+                        f.grid.shown_rows,
                         f.grid.overlay.len(),
                         f.count_pending,
                     ),

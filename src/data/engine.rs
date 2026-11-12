@@ -119,6 +119,8 @@ pub enum ExportFormat {
 pub struct RowBatch {
     pub epoch: u64,
     pub start_row: u64,
+    /// True file rowids, parallel to `rows`.
+    pub rowids: Vec<u64>,
     pub rows: Vec<Vec<CellValue>>,
 }
 
@@ -321,11 +323,12 @@ impl Worker {
     ) -> Result<RowBatch> {
         let start = page * crate::data::model::PAGE_SIZE as u64;
         let len = crate::data::model::PAGE_SIZE as u64;
-        let mut sql = String::from("SELECT ");
-        for (i, col) in self.schema.iter().enumerate() {
-            if i > 0 {
-                sql.push_str(", ");
-            }
+        // The first column is the row's true __rowid: the grid displays by
+        // view position (sort/filter order) but edits, deletes and the
+        // overlay are keyed by this id, which survives re-sorting.
+        let mut sql = String::from("SELECT __rowid");
+        for col in &self.schema {
+            sql.push_str(", ");
             sql.push_str(&sql_ident(&col.name));
         }
         sql.push_str(&self.select_suffix(sort, filter));
@@ -333,21 +336,25 @@ impl Worker {
 
         let mut stmt = self.conn.prepare(&sql)?;
         let n_cols = self.schema.len();
+        let mut rowids = Vec::with_capacity(len as usize);
+        let mut rows = Vec::with_capacity(len as usize);
         let mapped = stmt.query_map([], |r| {
+            let rowid: i64 = r.get(0)?;
+            rowids.push(rowid as u64);
             let mut row = Vec::with_capacity(n_cols);
             for i in 0..n_cols {
-                let v: duckdb::types::Value = r.get(i)?;
+                let v: duckdb::types::Value = r.get(i + 1)?;
                 row.push(value_to_cell(&v));
             }
             Ok(row)
         })?;
-        let mut rows = Vec::with_capacity(len as usize);
         for row in mapped {
             rows.push(row?);
         }
         Ok(RowBatch {
             epoch,
             start_row: start,
+            rowids,
             rows,
         })
     }
@@ -1074,7 +1081,8 @@ mod integration_tests {
         // Row 1 label text.
         assert_eq!(batch.rows[1][2], CellValue::Text("row_1".into()));
 
-        // Sorted descending by id: first row is id = 99.
+        // Sorted descending by id: first row is id = 99, and its TRUE rowid
+        // (99) must travel with it so edits/deletes address the right row.
         let batch = app.rows(
             0,
             vec![SortKey {
@@ -1084,6 +1092,8 @@ mod integration_tests {
             None,
         );
         assert_eq!(batch.rows[0][0], CellValue::Int(99));
+        assert_eq!(batch.rowids[0], 99);
+        assert_eq!(batch.rowids.len(), batch.rows.len());
 
         // Sorted ascending by score: first is id 0, score 0.0.
         let batch = app.rows(

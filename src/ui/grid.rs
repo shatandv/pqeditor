@@ -118,7 +118,9 @@ pub fn draw(ui: &mut Ui, app: &mut App) {
                 .body(|body| {
                     body.rows(theme::ROW_HEIGHT, total, |mut row| {
                         let row_idx = row.index();
-                        let rowid = row_idx as u64;
+                        // View position: addresses the cache; the true file
+                        // rowid comes from the fetched page.
+                        let pos = row_idx as u64;
                         seen = Some(match seen {
                             Some((lo, hi)) => (lo.min(row_idx), hi.max(row_idx)),
                             None => (row_idx, row_idx),
@@ -126,13 +128,13 @@ pub fn draw(ui: &mut Ui, app: &mut App) {
                         // Row tint: any row inside the selection rect; the
                         // head cell gets its own frame (see draw_cell).
                         let row_selected =
-                            sel_rect.is_some_and(|(r0, r1, _, _)| rowid >= r0 && rowid <= r1);
+                            sel_rect.is_some_and(|(r0, r1, _, _)| pos >= r0 && pos <= r1);
                         row.col(|ui| {
-                            draw_rownum_cell(ui, file, rowid, row_selected, ncols);
+                            draw_rownum_cell(ui, file, pos, row_selected, ncols);
                         });
                         for &col in visible_cols.iter() {
                             row.col(|ui| {
-                                draw_cell(ui, file, rowid, col, sel_rect, sel_head);
+                                draw_cell(ui, file, pos, col, sel_rect, sel_head);
                             });
                         }
                     });
@@ -172,9 +174,9 @@ pub fn draw(ui: &mut Ui, app: &mut App) {
                 let total = file.grid.cache.total();
                 if total > 0 {
                     file.selection = Some(crate::app::Sel {
-                        anchor: crate::app::Cell { rowid: 0, col },
+                        anchor: crate::app::Cell { pos: 0, col },
                         head: crate::app::Cell {
-                            rowid: total - 1,
+                            pos: total - 1,
                             col,
                         },
                     });
@@ -289,7 +291,7 @@ fn draw_header_cell(
 fn draw_rownum_cell(
     ui: &mut Ui,
     file: &mut crate::app::FileState,
-    rowid: u64,
+    pos: u64,
     selected: bool,
     ncols: usize,
 ) {
@@ -299,29 +301,29 @@ fn draw_rownum_cell(
     // Clicking the row number selects the whole row (Excel-style).
     let resp = ui.interact(
         ui.max_rect(),
-        ui.scope_id().with(("pq-rownum", rowid)),
+        ui.scope_id().with(("pq-rownum", pos)),
         Sense::click(),
     );
     if resp.clicked() && !ui.input(|i| i.modifiers.shift) {
         if file.editing.is_some() {
             file.commit_editing();
         }
-        file.selection = Some(crate::app::Sel::single_full_row(rowid, ncols));
+        file.selection = Some(crate::app::Sel::single_full_row(pos, ncols));
     } else if resp.clicked() {
         // Shift+click extends the row selection.
         if let Some(sel) = file.selection.as_mut() {
             sel.head = crate::app::Cell {
-                rowid,
+                pos,
                 col: ncols.saturating_sub(1),
             };
         }
     }
-    if resp.double_clicked() {
-        // Double-click a row number: nothing extra (selection already set).
-    }
+    // Show the row's true file rowid when the page is fetched (stable under
+    // sort); fall back to the view position while loading.
+    let shown = file.grid.rowid_at(pos).unwrap_or(pos);
     ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
         ui.label(
-            RichText::new(fmt_count(rowid))
+            RichText::new(fmt_count(shown))
                 .color(if selected {
                     theme::TEXT
                 } else {
@@ -335,14 +337,14 @@ fn draw_rownum_cell(
 fn draw_cell(
     ui: &mut Ui,
     file: &mut crate::app::FileState,
-    rowid: u64,
+    pos: u64,
     col: usize,
     sel_rect: Option<(u64, u64, usize, usize)>,
     sel_head: Option<crate::app::Cell>,
 ) {
     let (r0, r1, c0, c1) = sel_rect.unwrap_or((u64::MAX, 0, usize::MAX, 0));
-    let in_rect = rowid >= r0 && rowid <= r1 && col >= c0 && col <= c1;
-    let head_here = sel_head.is_some_and(|h| h.rowid == rowid && h.col == col);
+    let in_rect = pos >= r0 && pos <= r1 && col >= c0 && col <= c1;
+    let head_here = sel_head.is_some_and(|h| h.pos == pos && h.col == col);
     if in_rect {
         paint_row_bg(ui, theme::BG_SELECT);
     }
@@ -350,13 +352,13 @@ fn draw_cell(
     if file
         .editing
         .as_ref()
-        .is_some_and(|e| e.rowid == rowid && e.col == col)
+        .is_some_and(|e| e.pos == pos && e.col == col)
     {
         draw_editor(ui, file);
         return;
     }
 
-    let Some(cell) = file.grid.cell(rowid, col) else {
+    let Some(cell) = file.grid.cell(pos, col) else {
         ui.label(RichText::new("\u{2026}").color(theme::NULL_DOT).size(11.0));
         return;
     };
@@ -369,7 +371,7 @@ fn draw_cell(
     let rect = ui.available_rect_before_wrap().shrink(1.0);
     let resp = ui.interact(
         rect,
-        ui.scope_id().with(("pq-cell", rowid, col)),
+        ui.scope_id().with(("pq-cell", pos, col)),
         Sense::click(),
     );
 
@@ -389,7 +391,8 @@ fn draw_cell(
     }
 
     // Text as a real widget (AT-SPI/screen-reader visible), placed into the
-    // exact cell rect; right-aligned for numbers.
+    // exact cell rect; right-aligned for numbers. NOT selectable: text
+    // selection would swallow clicks and drag-select.
     let text = match cell.value {
         CellValue::Null => RichText::new("·").color(theme::NULL_DOT).size(13.0),
         ref v => RichText::new(v.display()).size(13.0).color(if cell.edited {
@@ -398,11 +401,10 @@ fn draw_cell(
             theme::TEXT
         }),
     };
-    let label = Label::new(text).sense(Sense::hover()).halign(if numeric {
-        Align::Max
-    } else {
-        Align::Min
-    });
+    let label = Label::new(text)
+        .selectable(false)
+        .sense(Sense::hover())
+        .halign(if numeric { Align::Max } else { Align::Min });
     ui.put(rect, label);
     if head_here {
         ui.painter().rect_stroke(
@@ -418,16 +420,16 @@ fn draw_cell(
     if resp.is_pointer_button_down_on() {
         match file.drag_select {
             None => {
-                file.drag_select = Some(crate::app::Cell { rowid, col });
+                file.drag_select = Some(crate::app::Cell { pos, col });
                 if !ui.input(|i| i.modifiers.shift) {
-                    file.selection = Some(crate::app::Sel::single(rowid, col));
+                    file.selection = Some(crate::app::Sel::single(pos, col));
                 }
             }
-            Some(d) if d.rowid != rowid || d.col != col => {
+            Some(d) if d.pos != pos || d.col != col => {
                 if let Some(sel) = file.selection.as_mut() {
-                    sel.head = crate::app::Cell { rowid, col };
+                    sel.head = crate::app::Cell { pos, col };
                 }
-                file.drag_select = Some(crate::app::Cell { rowid, col });
+                file.drag_select = Some(crate::app::Cell { pos, col });
             }
             _ => {}
         }
@@ -440,7 +442,7 @@ fn draw_cell(
             && !file
                 .editing
                 .as_ref()
-                .is_some_and(|e| e.rowid == rowid && e.col == col)
+                .is_some_and(|e| e.pos == pos && e.col == col)
         {
             file.commit_editing();
         }
@@ -449,26 +451,28 @@ fn draw_cell(
         file.drag_select = None;
     }
     if resp.double_clicked() {
-        file.selection = Some(crate::app::Sel::single(rowid, col));
-        file.begin_edit_at(rowid, col);
+        file.selection = Some(crate::app::Sel::single(pos, col));
+        file.begin_edit_at(pos, col);
     }
     if resp.secondary_clicked() {
-        file.selection = Some(crate::app::Sel::single(rowid, col));
+        file.selection = Some(crate::app::Sel::single(pos, col));
     }
     resp.context_menu(|ui| {
         let value_text = file
             .grid
-            .cell(rowid, col)
+            .cell(pos, col)
             .map(|c| c.value.display())
             .unwrap_or_default();
         if ui.button("edit cell").clicked() {
-            file.begin_edit_at(rowid, col);
+            file.begin_edit_at(pos, col);
             ui.close();
         }
         if ui.button("set NULL").clicked() {
-            file.grid
-                .overlay
-                .set(rowid, col, crate::data::types::EditValue::Null);
+            if let Some(rowid) = file.grid.rowid_at(pos) {
+                file.grid
+                    .overlay
+                    .set(rowid, col, crate::data::types::EditValue::Null);
+            }
             ui.close();
         }
         if ui.button("copy value").clicked() {
@@ -483,22 +487,26 @@ fn draw_editor(ui: &mut Ui, file: &mut crate::app::FileState) {
         return;
     };
     let width = ui.available_width().max(60.0);
-    // Stable id: position-derived ids shift as rows scroll, which would
-    // silently discard the edit buffer mid-typing.
+    // Stable id: the true rowid does not shift as rows scroll or the view
+    // is re-sorted.
     let editor = TextEdit::singleline(&mut edit.text)
         .id_salt(("pq-edit", edit.rowid, edit.col))
         .desired_width(width);
     let resp = ui.add_sized([width, theme::ROW_HEIGHT - 6.0], editor);
     resp.request_focus();
-    let focused = resp.has_focus();
+    if resp.has_focus() {
+        edit.had_focus = true;
+    }
     let (enter, esc) = ui.input(|i| (i.key_pressed(Key::Enter), i.key_pressed(Key::Escape)));
-    if focused && enter {
+    if resp.has_focus() && enter {
         file.commit_editing();
-    } else if focused && esc {
+    } else if resp.has_focus() && esc {
         file.editing = None;
-    } else if resp.lost_focus() {
-        // Clicked elsewhere / focus moved: commit like Excel does. A
-        // no-change commit is a no-op; an invalid value keeps the editor.
+    } else if edit.had_focus && resp.lost_focus() {
+        // Clicked elsewhere / focus moved: commit like Excel does. Only
+        // after the editor actually held focus at least once — a focus
+        // race must not silently commit a half-open editor. A no-change
+        // commit is a no-op; an invalid value keeps the editor.
         file.commit_editing();
     }
 }

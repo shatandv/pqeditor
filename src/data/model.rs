@@ -15,10 +15,10 @@ pub const PAGE_SIZE: u32 = 2_000;
 /// Keep at most this many pages in memory, then evict least-recently-used.
 const MAX_PAGES: usize = 512;
 
-type PageEntry = (u64, Option<Vec<Vec<CellValue>>>);
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct DisplayCell {
+    /// The row's true file rowid (stable across sort/filter).
+    pub rowid: u64,
     pub value: CellValue,
     /// Column index of the underlying column.
     pub col: usize,
@@ -27,8 +27,16 @@ pub struct DisplayCell {
     pub edited: bool,
 }
 
-/// Windowed cache keyed by original row index (== `__rowid`, 0-based here;
-/// the engine uses 1-based row_number and subtracts one).
+/// One fetched row as the cache stores it: the row's true file rowid plus
+/// the cell values in schema order.
+pub type PageRow = (u64, Vec<CellValue>);
+
+/// page index -> (last used tick, rows or None while fetch failed)
+type PageEntry = (u64, Option<Vec<PageRow>>);
+
+/// Windowed cache over the CURRENT view (sort/filter order). Pages hold
+/// display positions; each row keeps its true rowid so the UI can address
+/// the overlay, deletions and saves correctly under any sort.
 #[derive(Default)]
 pub struct RowCache {
     epoch: u64,
@@ -77,7 +85,7 @@ impl RowCache {
     }
 
     /// Store a fetched page. Rejects stale epochs.
-    pub fn put_page(&mut self, epoch: u64, page: u64, rows: Vec<Vec<CellValue>>) -> bool {
+    pub fn put_page(&mut self, epoch: u64, page: u64, rows: Vec<PageRow>) -> bool {
         if epoch != self.epoch {
             return false;
         }
@@ -107,7 +115,7 @@ impl RowCache {
     }
 
     /// Read access for the grid. Bumps the tick so the page is not evicted.
-    pub fn page(&mut self, page: u64) -> Option<&Vec<Vec<CellValue>>> {
+    pub fn page(&mut self, page: u64) -> Option<&Vec<PageRow>> {
         if let Some(entry) = self.pages.get_mut(&page) {
             entry.0 = self.tick;
         }
@@ -116,10 +124,12 @@ impl RowCache {
     }
 }
 
-/// A cell address in the grid.
+/// A cell address in the GRID: `pos` is the view position (sort/filter
+/// order), `col` the schema column. Actions resolve `pos` to the true file
+/// rowid through the cache before touching the overlay or worker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cell {
-    pub rowid: u64,
+    pub pos: u64,
     pub col: usize,
 }
 
@@ -131,28 +141,27 @@ pub struct Sel {
 }
 
 impl Sel {
-    pub fn single(rowid: u64, col: usize) -> Self {
-        let c = Cell { rowid, col };
+    pub fn single(pos: u64, col: usize) -> Self {
+        let c = Cell { pos, col };
         Self { anchor: c, head: c }
     }
 
     /// One row across every column (row-number click).
-    pub fn single_full_row(rowid: u64, ncols: usize) -> Self {
+    pub fn single_full_row(pos: u64, ncols: usize) -> Self {
         Self {
-            anchor: Cell { rowid, col: 0 },
+            anchor: Cell { pos, col: 0 },
             head: Cell {
-                rowid,
+                pos,
                 col: ncols.saturating_sub(1),
             },
         }
     }
 
     /// The selected rectangle as (first_row, last_row, first_col, last_col),
-    /// clamped to `ncols`. A whole-column selection (head.rowid = u64::MAX)
-    /// spans all rows given by `total`.
+    /// clamped to `ncols` and `total`.
     pub fn rect(&self, total: u64, ncols: usize) -> (u64, u64, usize, usize) {
-        let r0 = self.anchor.rowid.min(self.head.rowid);
-        let r1 = self.anchor.rowid.max(self.head.rowid);
+        let r0 = self.anchor.pos.min(self.head.pos);
+        let r1 = self.anchor.pos.max(self.head.pos);
         let c0 = self.anchor.col.min(self.head.col);
         let c1 = self.anchor.col.max(self.head.col);
         let r1 = r1.min(total.saturating_sub(1));
@@ -262,18 +271,19 @@ impl GridState {
     }
 
     /// A cell as the grid should show it: overlay first, cached value second.
-    /// Returns None while the row is not fetched yet (grid shows a
-    /// placeholder).
-    pub fn cell(&mut self, rowid: u64, col: usize) -> Option<DisplayCell> {
-        let page = rowid / PAGE_SIZE as u64;
+    /// `pos` is the view position; the returned `rowid` is the row's true
+    /// file rowid. Returns None while the row is not fetched yet (grid
+    /// shows a placeholder).
+    pub fn cell(&mut self, pos: u64, col: usize) -> Option<DisplayCell> {
+        let page = pos / PAGE_SIZE as u64;
+        let idx = (pos % PAGE_SIZE as u64) as usize;
         let cached = self
             .cache
             .page(page)
-            .and_then(|rows| rows.get((rowid % PAGE_SIZE as u64) as usize))
-            .and_then(|r| r.get(col))
-            .cloned();
+            .and_then(|rows| rows.get(idx))
+            .and_then(|(rowid, cells)| Some((*rowid, cells.get(col)?.clone())));
         match cached {
-            Some(base) => {
+            Some((rowid, base)) => {
                 let edited = self.overlay.get(rowid, col).is_some();
                 let value = match self.overlay.get(rowid, col) {
                     Some(EditValue::Null) => CellValue::Null,
@@ -293,10 +303,25 @@ impl GridState {
                     }
                     None => base,
                 };
-                Some(DisplayCell { value, col, edited })
+                Some(DisplayCell {
+                    rowid,
+                    value,
+                    col,
+                    edited,
+                })
             }
-            None => None,
+            _ => None,
         }
+    }
+
+    /// The true file rowid behind a view position, if the row is fetched.
+    pub fn rowid_at(&mut self, pos: u64) -> Option<u64> {
+        let page = pos / PAGE_SIZE as u64;
+        let idx = (pos % PAGE_SIZE as u64) as usize;
+        self.cache
+            .page(page)
+            .and_then(|rows| rows.get(idx))
+            .map(|(rowid, _)| *rowid)
     }
 
     /// Original cached value behind an edited cell, for the editor's initial
@@ -311,9 +336,10 @@ impl GridState {
         self.cell(rowid, col).map(|c| c.value.display())
     }
 
-    /// The selection rectangle as TSV (Ctrl+C). Missing (unfetched) cells
-    /// come out empty; dropped columns are skipped. Returns None for an
-    /// empty or oversized selection.
+    /// The selection rectangle as TSV (Ctrl+C). Positions are view
+    /// positions; missing (unfetched) cells come out empty; dropped columns
+    /// and deleted rows are skipped. Returns None for an empty or
+    /// oversized selection.
     pub fn copy_rect(&mut self, sel: &Sel, max_cells: usize) -> Option<String> {
         let ncols = self.schema.len();
         let (r0, r1, c0, c1) = sel.rect(self.cache.total(), ncols);
@@ -327,7 +353,10 @@ impl GridState {
         }
         let mut out = String::new();
         for r in r0..=r1 {
-            if self.overlay.is_row_deleted(r) {
+            if self
+                .rowid_at(r)
+                .is_none_or(|id| self.overlay.is_row_deleted(id))
+            {
                 continue;
             }
             let mut line = String::new();
@@ -371,7 +400,7 @@ mod tests {
     fn filled_cache() -> RowCache {
         let mut c = RowCache::default();
         c.clear(1, PAGE_SIZE as u64 * 2);
-        let p0: Vec<Vec<CellValue>> = (0..PAGE_SIZE as i64).map(val).collect();
+        let p0: Vec<PageRow> = (0..PAGE_SIZE as i64).map(|i| (i as u64, val(i))).collect();
         assert!(c.put_page(1, 0, p0));
         c
     }
@@ -391,7 +420,7 @@ mod tests {
     fn stale_epoch_rejected() {
         let mut c = RowCache::default();
         c.clear(1, 10);
-        assert!(!c.put_page(99, 0, vec![val(1)]));
+        assert!(!c.put_page(99, 0, vec![(7u64, val(1))]));
         assert!(c.page(0).is_none());
     }
 
@@ -419,7 +448,7 @@ mod tests {
             },
         ]);
         g.cache.clear(1, PAGE_SIZE as u64);
-        let p0: Vec<Vec<CellValue>> = (0..PAGE_SIZE as i64).map(val).collect();
+        let p0: Vec<PageRow> = (0..PAGE_SIZE as i64).map(|i| (i as u64, val(i))).collect();
         assert!(g.cache.put_page(1, 0, p0));
 
         let before = g.cell(5, 0).unwrap();
@@ -445,7 +474,7 @@ mod tests {
         );
         assert!(g.overlay.get(5, 0).is_some());
         // And once the page is re-fetched, display still shows the edit.
-        let p0: Vec<Vec<CellValue>> = (0..PAGE_SIZE as i64).map(val).collect();
+        let p0: Vec<PageRow> = (0..PAGE_SIZE as i64).map(|i| (i as u64, val(i))).collect();
         assert!(g.cache.put_page(2, 0, p0));
         assert_eq!(g.cell(5, 0).unwrap().value, CellValue::Int(77));
     }

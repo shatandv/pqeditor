@@ -16,7 +16,6 @@ pub struct FileState {
     pub path: PathBuf,
     pub grid: GridState,
     /// Rows matching the current filter; 0 while the count is in flight.
-    pub shown_rows: u64,
     /// Total rows in the file, independent of the filter.
     pub total_rows: u64,
     pub count_pending: bool,
@@ -46,7 +45,6 @@ impl FileState {
         Self {
             path,
             grid: GridState::new(schema),
-            shown_rows: total_rows,
             total_rows,
             count_pending: false,
             selection: None,
@@ -107,9 +105,14 @@ impl FileState {
         self.selection = None;
     }
 
-    /// Start editing a cell (type permitting). Deleted rows cannot be
-    /// edited.
-    pub fn begin_edit_at(&mut self, rowid: u64, col: usize) {
+    /// Start editing the cell at a view position (type permitting).
+    /// Deleted rows cannot be edited. The overlay is keyed by the row's
+    /// true rowid, resolved through the cache.
+    pub fn begin_edit_at(&mut self, pos: u64, col: usize) {
+        let Some(rowid) = self.grid.rowid_at(pos) else {
+            self.commit_error = Some("row is still loading".into());
+            return;
+        };
         if self.grid.overlay.is_row_deleted(rowid) {
             self.commit_error = Some("row is deleted (unsaved)".into());
             return;
@@ -131,10 +134,12 @@ impl FileState {
         }
         let text = self.grid.edit_source_text(rowid, col).unwrap_or_default();
         self.editing = Some(EditState {
+            pos,
             rowid,
             col,
             initial: text.clone(),
             text,
+            had_focus: false,
         });
     }
 
@@ -200,12 +205,19 @@ impl FileState {
 
 #[derive(Debug, Clone)]
 pub struct EditState {
+    /// View position of the cell being edited (grid addressing).
+    pub pos: u64,
+    /// True file rowid behind that position (overlay keying, save).
     pub rowid: u64,
     pub col: usize,
     pub text: String,
     /// What the cell showed when the editor opened; an unchanged commit is
     /// a no-op (no overlay entry, no unsaved-edit count).
     pub initial: String,
+    /// Set once the editor's TextEdit actually held keyboard focus; the
+    /// click-away commit only fires after this, so a focus race cannot
+    /// silently commit a half-open editor.
+    pub had_focus: bool,
 }
 
 /// The per-column filter popover.
@@ -457,6 +469,13 @@ impl App {
             file.filter_error = None;
             return;
         }
+        if filter.is_none() {
+            // Clearing needs no validation: drop the filter right away.
+            file.apply_filter(None);
+            self.refresh_count();
+            self.status = "filter cleared".into();
+            return;
+        }
         file.pending_filter = filter;
         file.filter_error = None;
         let epoch = file.grid.cache.epoch() + 1;
@@ -569,26 +588,32 @@ impl App {
     pub fn begin_edit(&mut self) {
         let Some(f) = self.file.as_mut() else { return };
         let Some(sel) = f.selection else { return };
-        f.begin_edit_at(sel.head.rowid, sel.head.col);
+        let (pos, col) = (sel.head.pos, sel.head.col);
+        f.begin_edit_at(pos, col);
     }
 
-    /// Set NULL on every selected cell.
+    /// Set NULL on every selected cell. Positions resolve to true rowids
+    /// through the cache; unfetched rows are skipped.
     pub fn set_cell_null(&mut self) {
         let Some(f) = self.file.as_mut() else { return };
         let Some(sel) = f.selection else { return };
         let total = f.grid.cache.total();
         let (r0, r1, c0, c1) = sel.rect(total, f.grid.schema.len());
         for r in r0..=r1 {
+            let Some(rowid) = f.grid.rowid_at(r) else {
+                continue;
+            };
             for c in c0..=c1 {
                 if f.grid.schema.get(c).is_some_and(|s| s.ty.editable()) {
-                    f.grid.overlay.set(r, c, EditValue::Null);
+                    f.grid.overlay.set(rowid, c, EditValue::Null);
                 }
             }
         }
     }
 
     /// Delete the selected rows (whole-row selection): the overlay marks
-    /// them, the worker's view excludes them, save rewrites without them.
+    /// them (by true rowid), the worker's view excludes them, save rewrites
+    /// without them.
     pub fn delete_selected_rows(&mut self) {
         let Some(f) = self.file.as_ref() else { return };
         let Some(sel) = f.selection else { return };
@@ -598,7 +623,10 @@ impl App {
             self.error = Some("click a row number to select whole rows first".into());
             return;
         }
-        let rows: Vec<u64> = (r0..=r1).collect();
+        let rows: Vec<u64> = {
+            let f = self.file.as_mut().unwrap();
+            (r0..=r1).filter_map(|r| f.grid.rowid_at(r)).collect()
+        };
         let all: Vec<u64> = {
             let f = self.file.as_mut().unwrap();
             f.grid.overlay.delete_rows(rows.iter().copied());
@@ -649,8 +677,12 @@ impl App {
                 line.split('\t').collect()
             };
             for (j, raw) in fields.iter().enumerate() {
-                let row = r0 + i as u64;
+                let pos = r0 + i as u64;
                 let col = c0 + j;
+                let Some(rowid) = f.grid.rowid_at(pos) else {
+                    rejected.get_or_insert_with(|| "row still loading".to_string());
+                    continue;
+                };
                 let Some(schema) = f.grid.schema.get(col) else {
                     continue;
                 };
@@ -659,7 +691,7 @@ impl App {
                 }
                 match crate::data::types::validate_edit(schema.ty, raw) {
                     Ok(val) => {
-                        f.grid.overlay.set(row, col, val);
+                        f.grid.overlay.set(rowid, col, val);
                         applied += 1;
                     }
                     Err(msg) => {
@@ -682,7 +714,7 @@ impl App {
         let Some(file) = self.file.as_mut() else {
             return;
         };
-        let total = file.shown_rows.max(file.grid.cache.total());
+        let total = file.grid.shown_rows.max(file.grid.cache.total());
         if total == 0 {
             return;
         }
@@ -690,20 +722,20 @@ impl App {
         let (row, col, anchor) = match file.selection {
             Some(sel) => {
                 let base = sel.head;
-                (base.rowid as i64 + drow, base.col as i64 + dcol, sel.anchor)
+                (base.pos as i64 + drow, base.col as i64 + dcol, sel.anchor)
             }
-            None => (0, 0, Cell { rowid: 0, col: 0 }),
+            None => (0, 0, Cell { pos: 0, col: 0 }),
         };
         let row = row.clamp(0, total as i64 - 1) as u64;
         let col = col.clamp(0, ncols - 1) as usize;
         let anchor = if extend {
             anchor
         } else {
-            Cell { rowid: row, col }
+            Cell { pos: row, col }
         };
         file.selection = Some(Sel {
             anchor,
-            head: Cell { rowid: row, col },
+            head: Cell { pos: row, col },
         });
         file.scroll_to_row = Some(row);
     }
@@ -738,7 +770,7 @@ impl App {
                             f.grid.cache.set_total(total);
                             self.status = format!("{} rows match", crate::util::fmt_count(total));
                         } else if epoch == f.grid.cache.epoch() {
-                            f.shown_rows = total;
+                            f.grid.shown_rows = total;
                             f.grid.cache.set_total(total);
                             f.count_pending = false;
                         }
@@ -746,10 +778,11 @@ impl App {
                 }
                 JobResult::Rows(batch) => {
                     if let Some(f) = self.file.as_mut() {
+                        let rows = batch.rowids.iter().cloned().zip(batch.rows).collect();
                         f.grid.cache.put_page(
                             batch.epoch,
                             batch.start_row / PAGE_SIZE as u64,
-                            batch.rows,
+                            rows,
                         );
                     }
                 }
@@ -920,7 +953,9 @@ mod app_tests {
 
         let f = app.file.as_mut().unwrap();
         f.grid.cache.clear(1, 10);
-        let rows: Vec<Vec<CellValue>> = (0..10).map(|i| vec![CellValue::Int(i)]).collect();
+        let rows: Vec<(u64, Vec<CellValue>)> = (0..10u64)
+            .map(|i| (i, vec![CellValue::Int(i as i64)]))
+            .collect();
         assert!(f.grid.cache.put_page(1, 0, rows));
 
         f.selection = Some(Sel::single(3, 0));
