@@ -131,6 +131,9 @@ RUNBOOK (in order):
    (status transitions saving -> saved -> opened; the panic hook now
    logs to dist/pqeditor-panic.log if the worker dies).
 5. Refresh dist/, report with the new md5 + size + build stamp.
+6. CLEANUP at the end of every Wine pass: kill the exe, `wineserver
+   -k`, kill the nested `Xwayland :99` — the user's monitor otherwise
+   keeps showing stray test windows (they noticed one overnight).
 
 CONSTRAINTS: no uncapped builds ever (machine froze once at 16-way);
 .cargo/config.toml caps at 2 jobs. The user sleeps near the box until

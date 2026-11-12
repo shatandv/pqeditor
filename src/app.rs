@@ -1101,6 +1101,16 @@ mod app_tests {
         .unwrap();
     }
 
+    /// Two-column file for the schema-change (drop column) scenarios.
+    fn make_parquet2(path: &Path, rows: i64) {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "COPY (SELECT i AS id, 'item_' || i AS label FROM range({rows}) t(i)) TO {}",
+            crate::data::types::sql_quote(&path.to_string_lossy())
+        ))
+        .unwrap();
+    }
+
     fn drain(app: &mut App) {
         for _ in 0..50 {
             app.poll();
@@ -1184,6 +1194,93 @@ mod app_tests {
         let v = app.file.as_mut().unwrap().grid.cell(3, 0).unwrap();
         assert_eq!(v.value, CellValue::Int(500));
         assert_eq!(parquet_int_count(&path, "id = 500"), 1);
+    }
+
+    #[test]
+    fn save_with_deleted_rows_resets_worker_view() {
+        // RowsChanged arm: after save the file lacks the deleted rows and
+        // the worker's view filter must be cleared, keeping the count
+        // correct (no double-exclusion).
+        let dir = tmp("save-delrows");
+        let path = dir.join("t.parquet");
+        make_parquet(&path, 100);
+        let app = &mut App::with_engine(Engine::spawn().unwrap(), Vec::new());
+        app.open_path(path.clone());
+        drain(app);
+        load_page0(app);
+
+        // Select rows 0..=1 via row-number clicks and delete them.
+        let f = app.file.as_mut().unwrap();
+        f.click_rownum(0, false);
+        f.click_rownum(1, true);
+        app.delete_selected_rows();
+        // The count round-trips after the requery; wait for it.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            app.poll();
+            if app.file.as_ref().unwrap().grid.shown_rows == 98 {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "count never updated");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        app.save();
+        wait_save(app);
+
+        assert!(app.file.as_ref().unwrap().grid.overlay.is_empty());
+        assert_eq!(parquet_row_count(&path), 98);
+        assert_eq!(parquet_int_count(&path, "id = 0"), 0);
+        assert_eq!(parquet_int_count(&path, "id = 1"), 0);
+        assert_eq!(parquet_int_count(&path, "id = 2"), 1);
+        // The on-screen count must stay 98 (not 96 = double exclusion).
+        assert_eq!(app.file.as_ref().unwrap().grid.shown_rows, 98);
+        assert_eq!(app.file.as_ref().unwrap().grid.cache.total(), 98);
+    }
+
+    #[test]
+    fn save_with_dropped_col_reopens_with_carry() {
+        // SchemaChanged arm: the re-open refreshes the schema and the
+        // sort survives (the view is carried over).
+        let dir = tmp("save-dropcol");
+        let path = dir.join("t.parquet");
+        make_parquet2(&path, 100);
+        let app = &mut App::with_engine(Engine::spawn().unwrap(), Vec::new());
+        app.open_path(path.clone());
+        drain(app);
+        assert_eq!(app.file.as_ref().unwrap().grid.schema.len(), 2);
+
+        app.cycle_sort(0, false); // sort by id asc
+        assert_eq!(app.file.as_ref().unwrap().grid.sort.len(), 1);
+
+        let f = app.file.as_mut().unwrap();
+        f.drop_col(1); // drop 'label'
+        app.save();
+        wait_save(app);
+
+        let f = app.file.as_ref().unwrap();
+        assert_eq!(
+            f.grid.schema.len(),
+            1,
+            "re-opened schema has only the surviving column"
+        );
+        assert_eq!(f.grid.sort.len(), 1, "sort carried over the re-open");
+        // The sort was by col 0 which is still index 0; the carried filter
+        // is empty. Sort keys pointing past the new schema would be a bug.
+        assert!(f.grid.sort[0].col < f.grid.schema.len());
+        // On disk the label column is gone.
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let cols: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT count(*) FROM (DESCRIBE SELECT * FROM read_parquet({}))",
+                    crate::data::types::sql_quote(&path.to_string_lossy())
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cols, 1);
     }
 
     #[test]
