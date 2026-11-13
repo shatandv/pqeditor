@@ -928,9 +928,13 @@ impl App {
                     let mut file = FileState::new(path, schema, total);
                     // The grid renders from the cache's total; seed it with
                     // the real row count right away. Without a filter the
-                    // shown count IS the file count.
+                    // shown count IS the file count. A file always opens at
+                    // the top: egui persists scroll offsets across runs and
+                    // would otherwise restore the previous session's
+                    // position on a file the user just opened.
                     file.grid.cache.set_total(total);
                     file.grid.shown_rows = total;
+                    file.scroll_to_row = Some(crate::app::ScrollRequest::Center(0));
                     // A save-with-drops re-open carries the view over so
                     // the grid doesn't jump back to unsorted file order.
                     // Consumed here: later opens must not inherit it.

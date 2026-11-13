@@ -30,7 +30,7 @@ fi
 export PATH="$HOME/.local/llvm-mingw-20240619-ucrt-ubuntu-20.04-x86_64/bin:$PATH"
 export CC_x86_64_pc_windows_gnullvm=x86_64-w64-mingw32-clang
 export CXX_x86_64_pc_windows_gnullvm=x86_64-w64-mingw32-clang++
-if cargo rustc --release --target x86_64-pc-windows-gnullvm -- \
+if cargo rustc --release --target x86_64-pc-windows-gnullvm --bin pqeditor -- \
     -C "link-arg=-L$PWD/cross/static" -C "link-arg=-Wl,-Bstatic"
 then
     cp target/x86_64-pc-windows-gnullvm/release/pqeditor.exe dist/pqeditor.exe
