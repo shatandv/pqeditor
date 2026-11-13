@@ -36,6 +36,26 @@ enum HeaderEvent {
     DropCol { col: usize },
 }
 
+/// Cell geometry captured during the table draw. Used afterwards to
+/// claim the body's column-edge strips: egui_extras registers column
+/// resize handles over the FULL table height and draws them last, so
+/// they win hit-testing at every column edge — eating clicks in the
+/// body. Our strips (registered after the table) take those clicks back
+/// for cell selection; the header keeps working resize handles.
+#[derive(Default)]
+struct GridGeom {
+    initialized: bool,
+    /// Top of the first visible row's cell.
+    top: f32,
+    bottom: f32,
+    /// View position of the first drawn row.
+    first_pos: u64,
+    /// Right edge (plus half the column spacing) of each visible column,
+    /// from the first drawn row. Boundary i is between visible column i
+    /// and i+1; visible column 0 is the row-number column.
+    boundaries: Vec<f32>,
+}
+
 pub fn draw(ui: &mut Ui, app: &mut App) {
     let App { engine, file, .. } = app;
     let Some(file) = file else { return };
@@ -61,6 +81,7 @@ pub fn draw(ui: &mut Ui, app: &mut App) {
     let mut header_events: Vec<HeaderEvent> = Vec::new();
     // Visible row range, filled during the body pass for page requests.
     let mut seen: Option<(usize, usize)> = None;
+    let geom = std::rc::Rc::new(std::cell::RefCell::new(GridGeom::default()));
 
     egui::CentralPanel::default()
         .frame(egui::Frame::NONE.fill(theme::BG_WINDOW))
@@ -139,15 +160,78 @@ pub fn draw(ui: &mut Ui, app: &mut App) {
                         let row_selected =
                             sel_rect.is_some_and(|(r0, r1, _, _)| pos >= r0 && pos <= r1);
                         row.col(|ui| {
-                            draw_rownum_cell(ui, file, pos, row_selected);
+                            draw_rownum_cell(ui, file, &geom, pos, row_selected);
                         });
                         for &col in visible_cols.iter() {
                             row.col(|ui| {
-                                draw_cell(ui, file, pos, col, sel_rect, sel_head);
+                                draw_cell(ui, file, &geom, pos, col, sel_rect, sel_head);
                             });
                         }
                     });
                 });
+            // Body column-edge strips: egui_extras' resize handles span the full
+            // table height and are drawn last, so at every column edge they won
+            // hit-testing — clicks in the body near an edge did nothing (and the
+            // cursor became a resize dragger). Register our own click strips
+            // after the table: egui's tie-break is "last registered", so these
+            // win in the body rows, mapping clicks to the adjacent cell. The
+            // header keeps egui's resize handles.
+            {
+                let g = geom.borrow();
+                if g.initialized {
+                    eprintln!(
+                        "dbg geom top={} bottom={} first_pos={} boundaries={:?} slot={}",
+                        g.top,
+                        g.bottom,
+                        g.first_pos,
+                        g.boundaries,
+                        theme::ROW_HEIGHT + ui.spacing().item_spacing.y
+                    );
+                }
+            }
+            let (initialized, top, bottom, first_pos, boundaries) = {
+                let g = geom.borrow();
+                (
+                    g.initialized,
+                    g.top,
+                    g.bottom,
+                    g.first_pos,
+                    g.boundaries.clone(),
+                )
+            };
+            if initialized && boundaries.len() > 1 {
+                let slot = theme::ROW_HEIGHT + ui.spacing().item_spacing.y;
+                for (i, &b) in boundaries.iter().enumerate() {
+                    let strip = egui::Rect::from_min_max(
+                        egui::pos2(b - 6.0, top),
+                        egui::pos2(b + 6.0, bottom),
+                    );
+                    let resp =
+                        ui.interact(strip, ui.scope_id().with(("pq-edge", i)), Sense::click());
+                    if resp.clicked()
+                        && let Some(p) = resp.interact_pointer_pos()
+                    {
+                        let shift = ui.input(|i| i.modifiers.shift);
+                        // Nearest row: a click in the spacing gap between
+                        // rows belongs to the row it is closest to.
+                        let row = (((p.y - top) / slot).round().max(0.0)) as u64;
+                        let lo = first_pos;
+                        let pos = lo.saturating_add(row);
+                        // Left of the boundary = the column that ends here,
+                        // right = the next one. Visible column 0 is the row
+                        // number column.
+                        if p.x <= b {
+                            if i == 0 {
+                                file.click_rownum(pos, shift);
+                            } else {
+                                file.click_cell(pos, i - 1, shift);
+                            }
+                        } else if i + 1 < boundaries.len() {
+                            file.click_cell(pos, i, shift);
+                        }
+                    }
+                }
+            }
         });
 
     // Track the rendered row range for Excel-style edge scrolling.
@@ -363,16 +447,35 @@ fn draw_header_cell(
     });
 }
 
-fn draw_rownum_cell(ui: &mut Ui, file: &mut crate::app::FileState, pos: u64, selected: bool) {
+fn draw_rownum_cell(
+    ui: &mut Ui,
+    file: &mut crate::app::FileState,
+    geom: &std::rc::Rc<std::cell::RefCell<GridGeom>>,
+    pos: u64,
+    selected: bool,
+) {
     if selected {
         paint_row_bg(ui, theme::BG_SELECT);
     }
-    // Clicking the row number selects the whole row (Excel-style).
-    let resp = ui.interact(
-        ui.max_rect(),
-        ui.scope_id().with(("pq-rownum", pos)),
-        Sense::click(),
-    );
+    {
+        let mut g = geom.borrow_mut();
+        let rect = ui.max_rect();
+        let spacing = ui.spacing().item_spacing.x;
+        if !g.initialized {
+            g.initialized = true;
+            g.top = rect.top();
+            g.bottom = rect.bottom();
+            g.first_pos = pos;
+            // First boundary: the row-number column's right edge, so its
+            // edge strip is claimed too (clicks left of it = row select).
+            g.boundaries.push(rect.right() + spacing * 0.5);
+        }
+        g.bottom = g.bottom.max(rect.bottom());
+    }
+    // Clicking the row number selects the whole row (Excel-style); the
+    // hit box covers the full cell plus the surrounding gap half.
+    let hit = ui.max_rect().expand2(0.5 * ui.spacing().item_spacing);
+    let resp = ui.interact(hit, ui.scope_id().with(("pq-rownum", pos)), Sense::click());
     if resp.clicked() {
         let shift = ui.input(|i| i.modifiers.shift);
         file.click_rownum(pos, shift);
@@ -400,6 +503,7 @@ fn draw_rownum_cell(ui: &mut Ui, file: &mut crate::app::FileState, pos: u64, sel
 fn draw_cell(
     ui: &mut Ui,
     file: &mut crate::app::FileState,
+    geom: &std::rc::Rc<std::cell::RefCell<GridGeom>>,
     pos: u64,
     col: usize,
     sel_rect: Option<(u64, u64, usize, usize)>,
@@ -429,11 +533,25 @@ fn draw_cell(
     let ty = file.grid.schema.get(col).map(|s| s.ty);
     let numeric = matches!(ty, Some(ColType::Integer) | Some(ColType::Float));
 
-    // The whole cell rect is the click target, not just the text (so NULL
-    // and short values are as easy to hit as wide ones).
+    // Hit box: the full cell area PLUS half the spacing around it. The
+    // visible gaps between cells are margins and row spacing, and a click
+    // there used to select nothing. (Adjacent hit boxes overlap in the
+    // middle of a gap; egui's tie-break is "last registered", so the
+    // lower/right cell wins — every click lands in a cell.)
+    let spacing = ui.spacing().item_spacing;
+    let hit = ui.max_rect().expand2(0.5 * spacing);
+    // The painted area stays snug around the value.
     let rect = ui.available_rect_before_wrap().shrink(1.0);
+    {
+        let mut g = geom.borrow_mut();
+        if g.initialized && pos == g.first_pos {
+            // First drawn row: record where each column ends, for the
+            // body edge-strip claim after the table.
+            g.boundaries.push(ui.max_rect().right() + spacing.x * 0.5);
+        }
+    }
     let resp = ui.interact(
-        rect,
+        hit,
         ui.scope_id().with(("pq-cell", pos, col)),
         Sense::click(),
     );
@@ -481,7 +599,7 @@ fn draw_cell(
     // Drag select: while the primary button is held, every cell the pointer
     // passes over extends the rect. (is_pointer_button_down_on is only true
     // for the press-origin widget, which never extends.)
-    let dragging = ui.input(|i| i.pointer.primary_down()) && ui.rect_contains_pointer(rect);
+    let dragging = ui.input(|i| i.pointer.primary_down()) && ui.rect_contains_pointer(hit);
     if dragging {
         let shift = ui.input(|i| i.modifiers.shift);
         file.pointer_on_cell(pos, col, shift);
@@ -532,11 +650,13 @@ fn draw_editor(ui: &mut Ui, file: &mut crate::app::FileState) {
     let editor = TextEdit::singleline(&mut edit.text)
         .id_salt(("pq-edit", edit.rowid, edit.col))
         .desired_width(width)
-        // Center the text like the cell's own value: top-aligned text
-        // made the edit box look cut off, with the text lower/higher
-        // than the neighbors.
+        // Center the text like the cell's own value.
         .align(egui::Align2::LEFT_CENTER);
-    let resp = ui.add_sized([width, theme::ROW_HEIGHT - 8.0], editor);
+    // Put the box into the exact cell rect: laid out top-down it sat
+    // below the row's text line and bled into the next row (the user's
+    // "cell looks cut off when editing").
+    let rect = ui.max_rect().shrink(1.0);
+    let resp = ui.put(rect, editor);
     resp.request_focus();
     if resp.has_focus() {
         edit.had_focus = true;
