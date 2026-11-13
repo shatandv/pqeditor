@@ -342,3 +342,14 @@ Pitfalls (all hit, all documented so they stay fixed):
   (script above) is the working approach.
 - Wine smoke test: `cd dist && timeout 30 wine pqeditor.exe` — exit 124
   or a clean window = pass; grep the log for `panicked`/`import_dll`.
+- Build stamp: build.rs stamps the WALL CLOCK and reruns when
+  `.build-stamp` is touched. Both shipped-build flows (cross/
+  build-windows.sh, tools/morning-run.sh) touch it. A plain `cargo
+  build` may reuse the previous stamp. Verify a fresh exe with
+  `strings dist/pqeditor.exe | grep -E "2026-11-13 [0-9]{2}:"`.
+- Harness pitfalls (round Nov 13 morning): topng.py previously split
+  the raw grab on \n bytes and truncated any frame whose pixels
+  contain 0x0a (this caused the false "modals render black" note;
+  modals render fine). Click offsets: ALL clicks need real = grab +
+  (4, 30), including toolbar buttons at the top — a toolbar click at
+  grab-y lands in the title bar otherwise.
