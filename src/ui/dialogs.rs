@@ -293,9 +293,15 @@ fn export_dialog(ctx: &egui::Context, app: &mut App) -> bool {
         ui.label(RichText::new("format").color(theme::TEXT_DIM).size(11.0));
         ui.horizontal(|ui| {
             if ui.selectable_label(dialog.format == ExportFormat::Csv, "csv").clicked() {
+                if dialog.format != ExportFormat::Csv {
+                    dialog.path = crate::util::swap_export_extension(&dialog.path, "csv");
+                }
                 dialog.format = ExportFormat::Csv;
             }
             if ui.selectable_label(dialog.format == ExportFormat::Xlsx, "xlsx").clicked() {
+                if dialog.format != ExportFormat::Xlsx {
+                    dialog.path = crate::util::swap_export_extension(&dialog.path, "xlsx");
+                }
                 dialog.format = ExportFormat::Xlsx;
             }
         });

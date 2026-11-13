@@ -197,6 +197,34 @@ pub fn run(app: &mut App, line: &str, out: &mut impl Write) -> Result<(), String
             need_file(app)?.pointer_release();
             Ok(())
         }
+        ["begin-edit", pos, col] => {
+            // Open the editor without touching its text: pins what the
+            // editor starts with (the filtered/sorted empty-editor bug).
+            let pos: u64 = pos.parse().map_err(|_| "bad pos".to_string())?;
+            let col: usize = col.parse().map_err(|_| "bad col".to_string())?;
+            let f = need_file(app)?;
+            f.begin_edit_at(pos, col);
+            if f.editing.is_none() {
+                return fail("editor did not open".into());
+            }
+            Ok(())
+        }
+        ["editor-close"] => {
+            need_file(app)?.editing = None;
+            Ok(())
+        }
+        ["assert-editor-text", expect @ ..] => {
+            let expect = expect.join(" ");
+            let got = need_file(app)?
+                .editing
+                .as_ref()
+                .map(|e| e.text.clone())
+                .unwrap_or_else(|| "<no editor>".into());
+            if got != expect {
+                return fail(format!("editor text = {got:?} (want {expect:?})"));
+            }
+            Ok(())
+        }
         ["dblclick", pos, col] => {
             let pos: u64 = pos.parse().map_err(|_| "bad pos".to_string())?;
             let col: usize = col.parse().map_err(|_| "bad col".to_string())?;

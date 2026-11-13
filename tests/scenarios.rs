@@ -273,6 +273,11 @@ fn scenario_multi_sort() {
 }
 
 #[test]
+fn scenario_editor_text() {
+    run_scenario("editor-text.txt", 1, 100, None);
+}
+
+#[test]
 fn scenario_filter_popover() {
     run_scenario("filter-popover.txt", 1, 100, None);
 }

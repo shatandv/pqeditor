@@ -371,14 +371,19 @@ impl GridState {
 
     /// Original cached value behind an edited cell, for the editor's initial
     /// content (fall back to the overlay value if the page evicted).
-    pub fn edit_source_text(&mut self, rowid: u64, col: usize) -> Option<String> {
+    pub fn edit_source_text(&mut self, pos: u64, col: usize) -> Option<String> {
+        // `pos` is the view position; the overlay is keyed by the true
+        // rowid. (Passing the rowid into `cell()` read the wrong row
+        // whenever the view was sorted or filtered — pos and rowid only
+        // coincide in a pristine unsorted view.)
+        let rowid = self.rowid_at(pos)?;
         if let Some(ev) = self.overlay.get(rowid, col) {
             return Some(match ev {
                 EditValue::Null => String::new(),
                 EditValue::Text(t) => t.clone(),
             });
         }
-        self.cell(rowid, col).map(|c| c.value.display())
+        self.cell(pos, col).map(|c| c.value.display())
     }
 
     /// The selection rectangle as TSV (Ctrl+C). Positions are view

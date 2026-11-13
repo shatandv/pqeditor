@@ -117,7 +117,9 @@ fn visuals() -> Visuals {
     v.widgets.active.fg_stroke = egui::Stroke::new(1.0, ACCENT_TEXT);
     v.selection = Selection {
         bg_fill: BG_SELECT,
-        stroke: egui::Stroke::new(1.0, BG_SELECT),
+        // Selected glyphs are painted with the stroke color: it must be
+        // light or selected text is illegible on the dark highlight.
+        stroke: egui::Stroke::new(1.0, TEXT),
     };
     v.hyperlink_color = ACCENT_TEXT;
     v.override_text_color = Some(TEXT);

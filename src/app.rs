@@ -164,7 +164,7 @@ impl FileState {
             ));
             return;
         }
-        let text = self.grid.edit_source_text(rowid, col).unwrap_or_default();
+        let text = self.grid.edit_source_text(pos, col).unwrap_or_default();
         self.editing = Some(EditState {
             pos,
             rowid,

@@ -54,19 +54,22 @@ pub fn toolbar(ui: &mut Ui, app: &mut App) -> Vec<PanelAction> {
                         true,
                         egui::Button::new(RichText::new("Open").color(theme::TEXT_HEADER)),
                     )
+                    .on_hover_text("Open a parquet file (Ctrl+O)")
                     .clicked()
                 {
                     actions.push(PanelAction::Open);
                 }
                 dbg("toolbar: open drawn");
-                let save_resp = ui.add_enabled(
-                    file_open,
-                    egui::Button::new(RichText::new("Save").color(if app.dirty() {
-                        theme::ACCENT_TEXT
-                    } else {
-                        theme::TEXT_HEADER
-                    })),
-                );
+                let save_resp = ui
+                    .add_enabled(
+                        file_open,
+                        egui::Button::new(RichText::new("Save").color(if app.dirty() {
+                            theme::ACCENT_TEXT
+                        } else {
+                            theme::TEXT_HEADER
+                        })),
+                    )
+                    .on_hover_text("Save edits to the file (Ctrl+S)");
                 dbg(&format!(
                     "toolbar: save drawn rect={:?} visible={}",
                     save_resp.rect,
@@ -82,6 +85,7 @@ pub fn toolbar(ui: &mut Ui, app: &mut App) -> Vec<PanelAction> {
                             RichText::new("Export\u{2026}").color(theme::TEXT_HEADER),
                         ),
                     )
+                    .on_hover_text("Export csv/xlsx (Ctrl+E)")
                     .clicked()
                 {
                     actions.push(PanelAction::Export);
@@ -110,6 +114,9 @@ pub fn toolbar(ui: &mut Ui, app: &mut App) -> Vec<PanelAction> {
                                 .color(theme::TEXT_DIM),
                         )
                         .desired_width(f32::INFINITY)
+                        // The hint sat a couple of pixels above the
+                        // toolbar's vertical center.
+                        .align(egui::Align2::LEFT_CENTER)
                         .frame(egui::Frame::NONE),
                 );
                 if app.focus_filter_next {

@@ -1,0 +1,16 @@
+# The editor must start with the cell's real value even when the view
+# is filtered or sorted (edit_source_text once passed the rowid where a
+# view position was expected — pos and rowid only coincide unsorted).
+open <PARQUET>
+wait-open
+page0
+sort 0 desc
+page0
+begin-edit 2 0
+assert-editor-text 97
+editor-close
+filter id > 90
+assert-count 9
+page0
+begin-edit 2 0
+assert-editor-text 97
