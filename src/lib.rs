@@ -5,6 +5,7 @@
 pub mod app;
 pub mod data;
 pub mod driver;
+pub mod shell;
 pub mod theme;
 pub mod ui;
 pub mod util;

@@ -5,4 +5,5 @@ assert-count 100
 filter id > 90
 assert-count 9
 filter-clear
+wait-count 100
 assert-count 100

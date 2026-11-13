@@ -146,7 +146,10 @@ pub fn run(app: &mut App, line: &str, out: &mut impl Write) -> Result<(), String
             f.commit_editing();
             Ok(())
         }
-        ["set-null"] => app.set_cell_null(),
+        ["set-null"] => {
+            app.set_cell_null();
+            Ok(())
+        }
         ["press-del"] => {
             // Del semantics live in main.rs; the driver re-states them so
             // the scenarios cover the same behavior.
@@ -168,7 +171,10 @@ pub fn run(app: &mut App, line: &str, out: &mut impl Write) -> Result<(), String
             need_file(app)?.drop_col(col);
             Ok(())
         }
-        ["paste", text @ ..] => app.paste_tsv(&unescape(&text.join(" "))),
+        ["paste", text @ ..] => {
+            app.paste_tsv(&unescape(&text.join(" ")));
+            Ok(())
+        }
         ["copy"] => {
             let text = {
                 let f = need_file(app)?;
@@ -186,7 +192,10 @@ pub fn run(app: &mut App, line: &str, out: &mut impl Write) -> Result<(), String
                 None => fail("copy returned nothing".into()),
             }
         }
-        ["save"] => app.save(),
+        ["save"] => {
+            app.save();
+            Ok(())
+        }
         ["wait-save"] => poll_until(
             app,
             |a| {
@@ -326,6 +335,14 @@ pub fn run(app: &mut App, line: &str, out: &mut impl Write) -> Result<(), String
                 None => fail("expected an error, got none".into()),
             }
         }
+        ["assert-filter-error", expect @ ..] => {
+            let expect = expect.join(" ");
+            match need_file(app)?.filter_error.as_deref() {
+                Some(e) if e.starts_with(&expect) => Ok(()),
+                Some(e) => fail(format!("filter error = {e:?} (want {expect:?})")),
+                None => fail("expected a filter error, got none".into()),
+            }
+        }
         _ => fail("unknown action".into()),
     }
 }
@@ -349,10 +366,8 @@ fn fail<T>(msg: String) -> Result<T, String> {
     Err(msg)
 }
 
-fn need_file<'a>(app: &'a mut App) -> Result<&'a mut crate::app::FileState, String> {
-    app.file
-        .as_mut()
-        .ok_or_else(|| "no file open".to_string())
+fn need_file(app: &mut App) -> Result<&mut crate::app::FileState, String> {
+    app.file.as_mut().ok_or_else(|| "no file open".to_string())
 }
 
 fn poll_until(

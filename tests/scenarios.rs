@@ -3,7 +3,8 @@
 //! exact behaviors a user (or the Wine pass) exercises. Run by the
 //! pre-push hook via `cargo test`.
 
-use std::io::Write;
+use std::fmt::Write as _;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -47,13 +48,16 @@ fn make_parquet2(path: &Path, rows: i64) {
 /// Read a scenario from tools/scenarios and substitute the file tokens.
 fn load_scenario(name: &str, p1: &Path, p2: Option<&Path>) -> String {
     let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let text = std::fs::read_to_string(repo.join("tools/scenarios").join(name))
-        .expect("scenario file");
+    let text =
+        std::fs::read_to_string(repo.join("tools/scenarios").join(name)).expect("scenario file");
     let token1 = "<PARQUET>".to_string();
     let token2 = "<PARQUET2>".to_string();
-    text.replace(&token2, &p2.map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|| "nonexistent.parquet".into()))
-        .replace(&token1, &p1.to_string_lossy())
+    text.replace(
+        &token2,
+        &p2.map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| "nonexistent.parquet".into()),
+    )
+    .replace(&token1, &p1.to_string_lossy())
 }
 
 /// Fail with the scenario's failure description and a state dump.
@@ -67,8 +71,11 @@ fn expect_pass(scenario: &str, result: Option<String>, app: &App) {
             let _ = writeln!(
                 buf,
                 "shown={} total={} overlay={} sort={:?} sel={:?}",
-                f.grid.shown_rows, f.total_rows, f.grid.overlay.len(),
-                f.grid.sort, f.selection.map(|s| (s.head.pos, s.head.col))
+                f.grid.shown_rows,
+                f.total_rows,
+                f.grid.overlay.len(),
+                f.grid.sort,
+                f.selection.map(|s| (s.head.pos, s.head.col))
             );
         }
         panic!("{buf}");
@@ -96,8 +103,10 @@ fn run_with_deadline(app: &mut App, scenario: &str, text: &str) -> Option<String
         if started.elapsed() > TIMEOUT {
             return Some("overall scenario timeout".into());
         }
-        if matches!(line.split_whitespace().next(), Some("wait-save") | Some("wait-open") | Some("wait-count"))
-        {
+        if matches!(
+            line.split_whitespace().next(),
+            Some("wait-save") | Some("wait-open") | Some("wait-count")
+        ) {
             continue;
         }
         std::thread::sleep(Duration::from_millis(10));

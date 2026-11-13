@@ -105,10 +105,7 @@ impl FileState {
 
     /// Set the sort stack to exactly this column (header menu commands).
     pub fn set_sort(&mut self, col: usize, ascending: bool) {
-        let sort = vec![SortKey {
-            col,
-            ascending,
-        }];
+        let sort = vec![SortKey { col, ascending }];
         let filter = self.grid.filter.clone();
         self.grid.requery(sort, filter);
         self.selection = None;
@@ -937,9 +934,7 @@ impl App {
                     // A save-with-drops re-open carries the view over so
                     // the grid doesn't jump back to unsorted file order.
                     // Consumed here: later opens must not inherit it.
-                    if let Some((sort, filter)) =
-                        self.pending_save.take().and_then(|p| p.carry)
-                    {
+                    if let Some((sort, filter)) = self.pending_save.take().and_then(|p| p.carry) {
                         file.grid.requery(sort, filter);
                         // The requery zeroed the count; answer it now.
                         self.refresh_count();
@@ -1026,8 +1021,7 @@ impl App {
                                 if let Some(f) = self.file.as_mut() {
                                     f.total_rows = f.grid.shown_rows;
                                 }
-                                self.engine
-                                    .send(Job::SetDeletedRows { rows: vec![] });
+                                self.engine.send(Job::SetDeletedRows { rows: vec![] });
                             }
                             Some(SaveOutcome::SchemaChanged) => {
                                 // The on-disk schema changed: re-open.
@@ -1036,6 +1030,7 @@ impl App {
                                 if let Some(f) = self.file.as_ref() {
                                     let path = f.path.clone();
                                     self.opening = Some(path.clone());
+                                    self.pending_save = pending;
                                     self.engine.send(Job::Open { path });
                                 }
                             }

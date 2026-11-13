@@ -5,5 +5,5 @@ wait-open
 filter id > 90
 assert-count 9
 filter id >
-assert-error
+assert-filter-error
 assert-count 9
