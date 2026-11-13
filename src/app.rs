@@ -208,8 +208,10 @@ impl FileState {
     }
 
     /// Plain click on a cell: an open editor on another cell commits
-    /// (click-away = commit, like Excel).
-    pub fn click_cell(&mut self, pos: u64, col: usize) {
+    /// (click-away = commit, like Excel). With shift and an existing
+    /// selection, the head moves to the clicked cell — Excel-style
+    /// range extension (anchor stays where the selection started).
+    pub fn click_cell(&mut self, pos: u64, col: usize, shift: bool) {
         if self
             .editing
             .as_ref()
@@ -218,6 +220,14 @@ impl FileState {
             self.commit_editing();
         }
         self.drag_select = None;
+        if shift {
+            // Excel semantics: extend from the anchor; with no selection
+            // yet, a shift+click simply selects the clicked cell.
+            match self.selection.as_mut() {
+                Some(sel) => sel.head = Cell { pos, col },
+                None => self.selection = Some(Sel::single(pos, col)),
+            }
+        }
     }
 
     /// Double-click on a cell opens the editor.
@@ -1571,7 +1581,7 @@ mod app_tests {
         // release ends the (non-)drag, the click finalizes.
         f.pointer_on_cell(6, 0, false);
         f.pointer_release();
-        f.click_cell(6, 0);
+        f.click_cell(6, 0, false);
         let sel = f.selection.unwrap();
         assert_eq!(sel.anchor, sel.head, "plain click after drag = single cell");
         assert_eq!(sel.head.pos, 6);
@@ -1599,11 +1609,11 @@ mod app_tests {
         f.editing.as_mut().unwrap().text = "77".into();
 
         // Click the SAME cell: editor stays.
-        f.click_cell(2, 0);
+        f.click_cell(2, 0, false);
         assert!(f.editing.is_some(), "click on edited cell keeps it open");
 
         // Click another cell: commit lands in the overlay.
-        f.click_cell(5, 0);
+        f.click_cell(5, 0, false);
         assert!(f.editing.is_none(), "click-away commits");
         assert!(!f.grid.overlay.is_empty(), "edited value stored");
     }

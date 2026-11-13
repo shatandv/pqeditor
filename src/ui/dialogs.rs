@@ -276,50 +276,70 @@ fn export_dialog(ctx: &egui::Context, app: &mut App) -> bool {
         ui.label(RichText::new("scope").color(theme::TEXT_DIM).size(11.0));
         ui.horizontal(|ui| {
             if ui
-                .selectable_label(dialog.scope == ExportScope::Filtered && filter_active, "filtered")
+                .selectable_label(
+                    dialog.scope == ExportScope::Filtered && filter_active,
+                    "filtered",
+                )
                 .clicked()
             {
                 dialog.scope = ExportScope::Filtered;
             }
-            if ui.selectable_label(dialog.scope == ExportScope::All, "all rows").clicked() {
+            if ui
+                .selectable_label(dialog.scope == ExportScope::All, "all rows")
+                .clicked()
+            {
                 dialog.scope = ExportScope::All;
             }
             if dialog.scope == ExportScope::Filtered && !filter_active {
-                ui.label(RichText::new("(no filter active \u{2192} everything)").color(theme::TEXT_DIM).size(10.5));
+                ui.label(
+                    RichText::new("(no filter active \u{2192} everything)")
+                        .color(theme::TEXT_DIM)
+                        .size(10.5),
+                );
             }
         });
 
         ui.add_space(6.0);
-        ui.label(RichText::new("format").color(theme::TEXT_DIM).size(11.0));
+        // Format and delimiter share one row, and the delimiter controls
+        // stay present but disabled for xlsx: the fields below would
+        // otherwise jump around when the format changes.
         ui.horizontal(|ui| {
-            if ui.selectable_label(dialog.format == ExportFormat::Csv, "csv").clicked() {
+            ui.label(RichText::new("format").color(theme::TEXT_DIM).size(11.0));
+            if ui
+                .selectable_label(dialog.format == ExportFormat::Csv, "csv")
+                .clicked()
+            {
                 if dialog.format != ExportFormat::Csv {
                     dialog.path = crate::util::swap_export_extension(&dialog.path, "csv");
                 }
                 dialog.format = ExportFormat::Csv;
             }
-            if ui.selectable_label(dialog.format == ExportFormat::Xlsx, "xlsx").clicked() {
+            if ui
+                .selectable_label(dialog.format == ExportFormat::Xlsx, "xlsx")
+                .clicked()
+            {
                 if dialog.format != ExportFormat::Xlsx {
                     dialog.path = crate::util::swap_export_extension(&dialog.path, "xlsx");
                 }
                 dialog.format = ExportFormat::Xlsx;
             }
-        });
-
-        if dialog.format == ExportFormat::Csv {
-            ui.add_space(6.0);
-            ui.label(RichText::new("delimiter").color(theme::TEXT_DIM).size(11.0));
-            ui.horizontal(|ui| {
+            ui.separator();
+            ui.add_enabled_ui(dialog.format == ExportFormat::Csv, |ui| {
+                ui.label(RichText::new("delimiter").color(theme::TEXT_DIM).size(11.0));
                 for (ch, label) in [(';', ";"), (',', ","), ('\t', "tab"), ('|', "|")] {
                     if ui.selectable_label(dialog.delimiter == ch, label).clicked() {
                         dialog.delimiter = ch;
                     }
                 }
             });
-        }
+        });
 
         ui.add_space(6.0);
-        ui.label(RichText::new("destination").color(theme::TEXT_DIM).size(11.0));
+        ui.label(
+            RichText::new("destination")
+                .color(theme::TEXT_DIM)
+                .size(11.0),
+        );
         ui.horizontal(|ui| {
             ui.add_sized(
                 [ui.available_width() - 80.0, 22.0],
@@ -331,21 +351,32 @@ fn export_dialog(ctx: &egui::Context, app: &mut App) -> bool {
         });
 
         ui.add_space(4.0);
-        ui.label(
-            RichText::new(
-                match dialog.format {
-                    ExportFormat::Csv => "csv: utf-8 (BOM) · edits included · runs in background",
-                    ExportFormat::Xlsx => "xlsx: bold frozen header · autofilter · autofit columns · typed cells · Excel row limit",
-                },
-            )
-            .color(theme::TEXT_DIM)
-            .size(10.5),
+        // Both hints are single-line and rendered in a fixed-height area:
+        // the wrapped two-line xlsx hint made egui expand the block, and
+        // the destination field and buttons shifted with every format
+        // switch. Keep the hint text short enough to never wrap.
+        let hint = match dialog.format {
+            ExportFormat::Csv => "csv: utf-8 (BOM) · edits included · runs in background",
+            ExportFormat::Xlsx => {
+                "xlsx: frozen header · autofilter · autofit · typed cells · row limit"
+            }
+        };
+        let hint_width = ui.available_width();
+        ui.allocate_ui_with_layout(
+            egui::vec2(hint_width, 24.0),
+            egui::Layout::top_down(egui::Align::LEFT),
+            |ui| {
+                ui.set_width(hint_width);
+                ui.label(RichText::new(hint).color(theme::TEXT_DIM).size(10.5));
+            },
         );
 
         ui.add_space(8.0);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui
-                .add(egui::Button::new(RichText::new("export").color(theme::ACCENT_TEXT)))
+                .add(egui::Button::new(
+                    RichText::new("export").color(theme::ACCENT_TEXT),
+                ))
                 .clicked()
             {
                 submit = true;

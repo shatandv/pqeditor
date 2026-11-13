@@ -167,7 +167,40 @@ pub fn run(app: &mut App, line: &str, out: &mut impl Write) -> Result<(), String
             let f = need_file(app)?;
             f.pointer_on_cell(pos, col, false);
             f.pointer_release();
-            f.click_cell(pos, col);
+            f.click_cell(pos, col, false);
+            Ok(())
+        }
+        ["shift-click", pos, col] => {
+            // Excel-style range extension: select, then shift+click.
+            let pos: u64 = pos.parse().map_err(|_| "bad pos".to_string())?;
+            let col: usize = col.parse().map_err(|_| "bad col".to_string())?;
+            let f = need_file(app)?;
+            f.pointer_on_cell(pos, col, true);
+            f.pointer_release();
+            f.click_cell(pos, col, true);
+            Ok(())
+        }
+        ["clear-selection"] => {
+            need_file(app)?.selection = None;
+            Ok(())
+        }
+        ["assert-sel-rect", r0, r1, c0, c1] => {
+            let parse = |s: &str| s.parse::<u64>().map_err(|_| "bad number".to_string());
+            let (r0, r1, c0, c1) = (parse(r0)?, parse(r1)?, parse(c0)?, parse(c1)?);
+            let got = {
+                let f = need_file(app)?;
+                let sel = f
+                    .selection
+                    .as_ref()
+                    .ok_or_else(|| "no selection".to_string())?;
+                sel.rect(f.grid.cache.total(), f.grid.schema.len())
+            };
+            if (got.0, got.1) != (r0, r1) || (got.2 as u64, got.3 as u64) != (c0, c1) {
+                return fail(format!(
+                    "sel rect = {:?} (want {r0}..{r1} x {c0}..{c1})",
+                    got
+                ));
+            }
             Ok(())
         }
         ["click-row", pos] => {

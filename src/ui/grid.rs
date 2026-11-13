@@ -488,7 +488,8 @@ fn draw_cell(
     }
 
     if resp.clicked() {
-        file.click_cell(pos, col);
+        let shift = ui.input(|i| i.modifiers.shift);
+        file.click_cell(pos, col, shift);
     }
     if resp.double_clicked() {
         file.double_click_cell(pos, col);
@@ -530,8 +531,12 @@ fn draw_editor(ui: &mut Ui, file: &mut crate::app::FileState) {
     // is re-sorted.
     let editor = TextEdit::singleline(&mut edit.text)
         .id_salt(("pq-edit", edit.rowid, edit.col))
-        .desired_width(width);
-    let resp = ui.add_sized([width, theme::ROW_HEIGHT - 6.0], editor);
+        .desired_width(width)
+        // Center the text like the cell's own value: top-aligned text
+        // made the edit box look cut off, with the text lower/higher
+        // than the neighbors.
+        .align(egui::Align2::LEFT_CENTER);
+    let resp = ui.add_sized([width, theme::ROW_HEIGHT - 8.0], editor);
     resp.request_focus();
     if resp.has_focus() {
         edit.had_focus = true;
