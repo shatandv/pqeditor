@@ -30,6 +30,12 @@ mkdir -p dist
 cp -f "$EXE" dist/
 cp -f test-data.parquet dist/
 
+# Cache-busting copy: every build also lands under a unique name, so a
+# download UI caching by filename can never serve a stale exe. The
+# title-bar build stamp is the other half of the check.
+rm -f dist/pqeditor-2*.exe
+cp -f dist/pqeditor.exe "dist/pqeditor-$(date +%Y%m%d-%H%M).exe"
+
 echo
 echo "deliverables in dist/:"
 ls -la dist/
