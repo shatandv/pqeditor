@@ -361,6 +361,15 @@ pub fn run_native(open_path: Option<std::path::PathBuf>) {
         "pqeditor",
         options,
         Box::new(move |cc| {
+            // Debug/testing knob: force a UI scale factor, e.g.
+            // PQEDITOR_SCALE=1.5 to reproduce high-DPI layouts.
+            if let Some(s) = std::env::var("PQEDITOR_SCALE")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .filter(|s| *s >= 0.5 && *s <= 4.0)
+            {
+                cc.egui_ctx.set_pixels_per_point(s);
+            }
             let mut app = App::new(cc);
             if let Some(path) = open_path {
                 app.open_path(path);

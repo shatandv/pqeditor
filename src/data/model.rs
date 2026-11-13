@@ -247,10 +247,17 @@ pub struct GridState {
     pub cache: RowCache,
     pub overlay: EditOverlay,
     pub shown_rows: u64,
+    /// Column widths (points, per schema column), resized from the
+    /// header row. Plain data so it can live in the view state.
+    pub col_widths: Vec<f32>,
 }
+
+/// Default column width until the user resizes it from the header.
+pub const DEFAULT_COL_WIDTH: f32 = 130.0;
 
 impl GridState {
     pub fn new(schema: Vec<crate::data::types::ColumnSchema>) -> Self {
+        let ncols = schema.len();
         Self {
             schema,
             sort: Vec::new(),
@@ -258,6 +265,7 @@ impl GridState {
             cache: RowCache::default(),
             overlay: EditOverlay::default(),
             shown_rows: 0,
+            col_widths: vec![DEFAULT_COL_WIDTH; ncols],
         }
     }
 

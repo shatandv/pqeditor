@@ -21,7 +21,6 @@ use crate::util::fmt_count;
 
 const HEADER_HEIGHT: f32 = 26.0;
 const ROWNUM_WIDTH: f32 = 64.0;
-const COL_DEFAULT_WIDTH: f32 = 130.0;
 
 /// Deferred header interactions.
 enum HeaderEvent {
@@ -34,26 +33,6 @@ enum HeaderEvent {
     CopyName { col: usize },
     SelectCol { col: usize },
     DropCol { col: usize },
-}
-
-/// Cell geometry captured during the table draw. Used afterwards to
-/// claim the body's column-edge strips: egui_extras registers column
-/// resize handles over the FULL table height and draws them last, so
-/// they win hit-testing at every column edge — eating clicks in the
-/// body. Our strips (registered after the table) take those clicks back
-/// for cell selection; the header keeps working resize handles.
-#[derive(Default)]
-struct GridGeom {
-    initialized: bool,
-    /// Top of the first visible row's cell.
-    top: f32,
-    bottom: f32,
-    /// View position of the first drawn row.
-    first_pos: u64,
-    /// Right edge (plus half the column spacing) of each visible column,
-    /// from the first drawn row. Boundary i is between visible column i
-    /// and i+1; visible column 0 is the row-number column.
-    boundaries: Vec<f32>,
 }
 
 pub fn draw(ui: &mut Ui, app: &mut App) {
@@ -81,7 +60,6 @@ pub fn draw(ui: &mut Ui, app: &mut App) {
     let mut header_events: Vec<HeaderEvent> = Vec::new();
     // Visible row range, filled during the body pass for page requests.
     let mut seen: Option<(usize, usize)> = None;
-    let geom = std::rc::Rc::new(std::cell::RefCell::new(GridGeom::default()));
 
     egui::CentralPanel::default()
         .frame(egui::Frame::NONE.fill(theme::BG_WINDOW))
@@ -91,21 +69,27 @@ pub fn draw(ui: &mut Ui, app: &mut App) {
                 return;
             }
 
+            // Column widths are ours (GridState::col_widths), resized from
+            // the header row: egui_extras' own resize handles span only
+            // the body rows (its `table_top` is captured below the
+            // header), so header resize has to be implemented here.
             let mut table = TableBuilder::new(ui)
                 .id_salt("pq-grid")
                 .striped(false)
-                .resizable(true)
+                .resizable(false)
                 .cell_layout(egui::Layout::left_to_right(Align::Center))
                 .column(Column::exact(ROWNUM_WIDTH))
                 .vscroll(true)
                 .animate_scrolling(false)
                 .auto_shrink([false, false]);
-            for _ in 0..ncols_visible {
-                table = table.column(
-                    Column::initial(COL_DEFAULT_WIDTH)
-                        .resizable(true)
-                        .clip(true),
-                );
+            for &col in visible_cols.iter() {
+                let w = file
+                    .grid
+                    .col_widths
+                    .get(col)
+                    .copied()
+                    .unwrap_or(crate::data::model::DEFAULT_COL_WIDTH);
+                table = table.column(Column::exact(w).clip(true));
             }
             let table = match scroll_to {
                 Some(ScrollRequest::Center(idx)) => {
@@ -122,6 +106,7 @@ pub fn draw(ui: &mut Ui, app: &mut App) {
                 .header(HEADER_HEIGHT, {
                     let events = &mut header_events;
                     let visible = &visible_cols;
+                    let file = &mut *file;
                     move |mut header| {
                         header.col(|ui| {
                             ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
@@ -135,6 +120,7 @@ pub fn draw(ui: &mut Ui, app: &mut App) {
                             header.col(|ui| {
                                 draw_header_cell(
                                     ui,
+                                    file,
                                     events,
                                     ci,
                                     &col.name,
@@ -160,78 +146,15 @@ pub fn draw(ui: &mut Ui, app: &mut App) {
                         let row_selected =
                             sel_rect.is_some_and(|(r0, r1, _, _)| pos >= r0 && pos <= r1);
                         row.col(|ui| {
-                            draw_rownum_cell(ui, file, &geom, pos, row_selected);
+                            draw_rownum_cell(ui, file, pos, row_selected);
                         });
                         for &col in visible_cols.iter() {
                             row.col(|ui| {
-                                draw_cell(ui, file, &geom, pos, col, sel_rect, sel_head);
+                                draw_cell(ui, file, pos, col, sel_rect, sel_head);
                             });
                         }
                     });
                 });
-            // Body column-edge strips: egui_extras' resize handles span the full
-            // table height and are drawn last, so at every column edge they won
-            // hit-testing — clicks in the body near an edge did nothing (and the
-            // cursor became a resize dragger). Register our own click strips
-            // after the table: egui's tie-break is "last registered", so these
-            // win in the body rows, mapping clicks to the adjacent cell. The
-            // header keeps egui's resize handles.
-            {
-                let g = geom.borrow();
-                if g.initialized {
-                    eprintln!(
-                        "dbg geom top={} bottom={} first_pos={} boundaries={:?} slot={}",
-                        g.top,
-                        g.bottom,
-                        g.first_pos,
-                        g.boundaries,
-                        theme::ROW_HEIGHT + ui.spacing().item_spacing.y
-                    );
-                }
-            }
-            let (initialized, top, bottom, first_pos, boundaries) = {
-                let g = geom.borrow();
-                (
-                    g.initialized,
-                    g.top,
-                    g.bottom,
-                    g.first_pos,
-                    g.boundaries.clone(),
-                )
-            };
-            if initialized && boundaries.len() > 1 {
-                let slot = theme::ROW_HEIGHT + ui.spacing().item_spacing.y;
-                for (i, &b) in boundaries.iter().enumerate() {
-                    let strip = egui::Rect::from_min_max(
-                        egui::pos2(b - 6.0, top),
-                        egui::pos2(b + 6.0, bottom),
-                    );
-                    let resp =
-                        ui.interact(strip, ui.scope_id().with(("pq-edge", i)), Sense::click());
-                    if resp.clicked()
-                        && let Some(p) = resp.interact_pointer_pos()
-                    {
-                        let shift = ui.input(|i| i.modifiers.shift);
-                        // Nearest row: a click in the spacing gap between
-                        // rows belongs to the row it is closest to.
-                        let row = (((p.y - top) / slot).round().max(0.0)) as u64;
-                        let lo = first_pos;
-                        let pos = lo.saturating_add(row);
-                        // Left of the boundary = the column that ends here,
-                        // right = the next one. Visible column 0 is the row
-                        // number column.
-                        if p.x <= b {
-                            if i == 0 {
-                                file.click_rownum(pos, shift);
-                            } else {
-                                file.click_cell(pos, i - 1, shift);
-                            }
-                        } else if i + 1 < boundaries.len() {
-                            file.click_cell(pos, i, shift);
-                        }
-                    }
-                }
-            }
         });
 
     // Track the rendered row range for Excel-style edge scrolling.
@@ -342,6 +265,7 @@ pub fn draw(ui: &mut Ui, app: &mut App) {
 
 fn draw_header_cell(
     ui: &mut Ui,
+    file: &mut crate::app::FileState,
     events: &mut Vec<HeaderEvent>,
     col: usize,
     name: &str,
@@ -391,6 +315,31 @@ fn draw_header_cell(
         ui.scope_id().with(("pq-hdr", col)),
         Sense::click(),
     );
+
+    // Column resize from the HEADER only: a narrow drag strip at the
+    // cell's right edge. Widths live in GridState::col_widths; the table
+    // uses them as exact widths. (egui_extras' built-in resize handles
+    // only cover the body rows, which is the opposite of what a user
+    // expects — see the round-5 report.)
+    let cell = ui.max_rect();
+    let handle = egui::Rect::from_min_max(
+        egui::pos2(cell.right() - 4.0, cell.top()),
+        egui::pos2(cell.right() + 4.0, cell.bottom()),
+    );
+    let resize = ui.interact(
+        handle,
+        ui.scope_id().with(("pq-colw", col)),
+        Sense::click_and_drag(),
+    );
+    let resize = resize.on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+    if resize.dragged()
+        && let Some(p) = ui.ctx().pointer_latest_pos()
+    {
+        let w = (p.x - cell.left()).clamp(40.0, 2000.0);
+        if let Some(slot) = file.grid.col_widths.get_mut(col) {
+            *slot = w;
+        }
+    }
     if resp.clicked() {
         events.push(HeaderEvent::Sort {
             col,
@@ -447,30 +396,9 @@ fn draw_header_cell(
     });
 }
 
-fn draw_rownum_cell(
-    ui: &mut Ui,
-    file: &mut crate::app::FileState,
-    geom: &std::rc::Rc<std::cell::RefCell<GridGeom>>,
-    pos: u64,
-    selected: bool,
-) {
+fn draw_rownum_cell(ui: &mut Ui, file: &mut crate::app::FileState, pos: u64, selected: bool) {
     if selected {
         paint_row_bg(ui, theme::BG_SELECT);
-    }
-    {
-        let mut g = geom.borrow_mut();
-        let rect = ui.max_rect();
-        let spacing = ui.spacing().item_spacing.x;
-        if !g.initialized {
-            g.initialized = true;
-            g.top = rect.top();
-            g.bottom = rect.bottom();
-            g.first_pos = pos;
-            // First boundary: the row-number column's right edge, so its
-            // edge strip is claimed too (clicks left of it = row select).
-            g.boundaries.push(rect.right() + spacing * 0.5);
-        }
-        g.bottom = g.bottom.max(rect.bottom());
     }
     // Clicking the row number selects the whole row (Excel-style); the
     // hit box covers the full cell plus the surrounding gap half.
@@ -503,7 +431,6 @@ fn draw_rownum_cell(
 fn draw_cell(
     ui: &mut Ui,
     file: &mut crate::app::FileState,
-    geom: &std::rc::Rc<std::cell::RefCell<GridGeom>>,
     pos: u64,
     col: usize,
     sel_rect: Option<(u64, u64, usize, usize)>,
@@ -542,14 +469,6 @@ fn draw_cell(
     let hit = ui.max_rect().expand2(0.5 * spacing);
     // The painted area stays snug around the value.
     let rect = ui.available_rect_before_wrap().shrink(1.0);
-    {
-        let mut g = geom.borrow_mut();
-        if g.initialized && pos == g.first_pos {
-            // First drawn row: record where each column ends, for the
-            // body edge-strip claim after the table.
-            g.boundaries.push(ui.max_rect().right() + spacing.x * 0.5);
-        }
-    }
     let resp = ui.interact(
         hit,
         ui.scope_id().with(("pq-cell", pos, col)),
@@ -651,7 +570,12 @@ fn draw_editor(ui: &mut Ui, file: &mut crate::app::FileState) {
         .id_salt(("pq-edit", edit.rowid, edit.col))
         .desired_width(width)
         // Center the text like the cell's own value.
-        .align(egui::Align2::LEFT_CENTER);
+        .align(egui::Align2::LEFT_CENTER)
+        // The theme's TextEdit min height (interact_size) plus the frame
+        // margin exceeds the row height: the box bled into the row below
+        // and the text sat low (worse at 150% DPI). A small margin keeps
+        // the natural height inside the cell.
+        .margin(egui::Margin::symmetric(6, 0));
     // Put the box into the exact cell rect: laid out top-down it sat
     // below the row's text line and bled into the next row (the user's
     // "cell looks cut off when editing").
