@@ -20,7 +20,8 @@ export CXX_x86_64_pc_windows_gnullvm=x86_64-w64-mingw32-clang++
 
 # cargo rustc (not plain cargo build) so the static-link args apply only to
 # the final binary — keeps the dependency cache valid across iterations.
-cargo rustc --release --target "$TARGET" -- \
+touch .build-stamp   # build.rs watches this: refreshes the title stamp
+cargo rustc --release --target "$TARGET" --bin pqeditor -- \
     -C "link-arg=-L$STATIC" \
     -C "link-arg=-Wl,-Bstatic"
 
