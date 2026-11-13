@@ -61,6 +61,28 @@ pub fn draw(ui: &mut Ui, app: &mut App) {
     // Visible row range, filled during the body pass for page requests.
     let mut seen: Option<(usize, usize)> = None;
 
+    // Column-separator x offsets, relative to the row-number cell's left
+    // edge (StripLayout advances width + item spacing). Visual only: the
+    // lines are painted in the row-number cell, which is unclipped, so
+    // they run continuously down the body.
+    let sep_offsets: Vec<f32> = {
+        let sp = ui.spacing().item_spacing.x;
+        let mut x = ROWNUM_WIDTH + sp * 0.5;
+        let mut v = vec![x];
+        for &col in visible_cols.iter() {
+            x += file
+                .grid
+                .col_widths
+                .get(col)
+                .copied()
+                .unwrap_or(crate::data::model::DEFAULT_COL_WIDTH)
+                + sp;
+            v.push(x);
+        }
+        v
+    };
+    let sep_offsets = &sep_offsets;
+
     egui::CentralPanel::default()
         .frame(egui::Frame::NONE.fill(theme::BG_WINDOW))
         .show(ui, |ui| {
@@ -114,6 +136,14 @@ pub fn draw(ui: &mut Ui, app: &mut App) {
                                     RichText::new("\u{25b2}#").color(theme::TEXT_DIM).size(11.0),
                                 );
                             });
+                            // Separator between the row-number and first
+                            // data column, continuous with the body lines.
+                            let hr = ui.max_rect();
+                            let hx = hr.right() + ui.spacing().item_spacing.x * 0.5;
+                            ui.painter().line_segment(
+                                [egui::pos2(hx, hr.top()), egui::pos2(hx, hr.bottom())],
+                                ui.style().visuals.widgets.noninteractive.bg_stroke,
+                            );
                         });
                         for &ci in visible.iter() {
                             let col = &schema[ci];
@@ -146,7 +176,7 @@ pub fn draw(ui: &mut Ui, app: &mut App) {
                         let row_selected =
                             sel_rect.is_some_and(|(r0, r1, _, _)| pos >= r0 && pos <= r1);
                         row.col(|ui| {
-                            draw_rownum_cell(ui, file, pos, row_selected);
+                            draw_rownum_cell(ui, file, sep_offsets, pos, row_selected);
                         });
                         for &col in visible_cols.iter() {
                             row.col(|ui| {
@@ -316,6 +346,15 @@ fn draw_header_cell(
         Sense::click(),
     );
 
+    // Column separator in the header row (visual only, same stroke as the
+    // body separators painted in draw_rownum_cell).
+    let hr = ui.max_rect();
+    let hx = hr.right() + ui.spacing().item_spacing.x * 0.5;
+    ui.painter().line_segment(
+        [egui::pos2(hx, hr.top()), egui::pos2(hx, hr.bottom())],
+        ui.style().visuals.widgets.noninteractive.bg_stroke,
+    );
+
     // Column resize from the HEADER only: a narrow drag strip at the
     // cell's right edge. Widths live in GridState::col_widths; the table
     // uses them as exact widths. (egui_extras' built-in resize handles
@@ -396,9 +435,39 @@ fn draw_header_cell(
     });
 }
 
-fn draw_rownum_cell(ui: &mut Ui, file: &mut crate::app::FileState, pos: u64, selected: bool) {
+fn draw_rownum_cell(
+    ui: &mut Ui,
+    file: &mut crate::app::FileState,
+    sep_offsets: &[f32],
+    pos: u64,
+    selected: bool,
+) {
     if selected {
         paint_row_bg(ui, theme::BG_SELECT);
+    }
+    // Column separators (visual only): one vertical line at every column
+    // boundary. Painted here (this column is unclipped) with the painter
+    // clip widened to the table width, so the lines run continuously down
+    // the body. No interaction: resizing lives in the header row.
+    let g = ui.max_rect();
+    let stroke = ui.style().visuals.widgets.noninteractive.bg_stroke;
+    if let Some(&last) = sep_offsets.last() {
+        let clip = ui.clip_rect();
+        let wide = egui::Rect::from_min_max(
+            egui::pos2(clip.left(), clip.top().max(g.top())),
+            egui::pos2(clip.left() + last + 8.0, clip.bottom().max(g.bottom())),
+        );
+        ui.set_clip_rect(wide);
+        for &off in sep_offsets {
+            ui.painter().line_segment(
+                [
+                    egui::pos2(g.left() + off, g.top()),
+                    egui::pos2(g.left() + off, g.bottom() + 8.0),
+                ],
+                stroke,
+            );
+        }
+        ui.set_clip_rect(clip);
     }
     // Clicking the row number selects the whole row (Excel-style); the
     // hit box covers the full cell plus the surrounding gap half.
@@ -413,15 +482,11 @@ fn draw_rownum_cell(ui: &mut Ui, file: &mut crate::app::FileState, pos: u64, sel
     let shown = file.grid.rowid_at(pos).unwrap_or(pos);
     ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
         ui.add(
-            Label::new(
-                RichText::new(fmt_count(shown))
-                    .color(if selected {
-                        theme::TEXT
-                    } else {
-                        theme::TEXT_DIM
-                    })
-                    .size(11.0),
-            )
+            Label::new(RichText::new(fmt_count(shown)).color(if selected {
+                theme::TEXT
+            } else {
+                theme::TEXT_DIM
+            }))
             .selectable(false)
             .sense(Sense::hover()),
         );

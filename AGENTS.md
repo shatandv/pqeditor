@@ -293,6 +293,44 @@ VERIFICATION TOOLING (rebuild if /tmp was wiped):
   (black body) — environment artifact; modal width is verifiable from
   the frame outline. eframe __screenshot saves a white buffer here.
 
+## BUG CHECKLIST (open, reported by the user, deferred by agreement)
+
+TEST-RIG RULES learned the hard way (round 5):
+- The native test app opens on the user's WAYLAND session by default
+  (winit prefers Wayland when WAYLAND_DISPLAY is set) — every "native"
+  verification actually grabbed a stale WINE instance on :99. Launch
+  native test apps with `env -u WAYLAND_DISPLAY -u XDG_SESSION_TYPE
+  WINIT_UNIX_BACKEND=x11` and VERIFY the status-bar path (no Z: prefix)
+  in every grab.
+- xgrab read BGRX as RGBX: every grab had R/B swapped. Fixed in
+  xgrab.c (red = (p>>16)&255). All pixel forensics before this fix is
+  suspect.
+- pkill patterns that appear in the shell's own command line kill the
+  shell mid-block, leaving old instances alive. Use `pkill -x NAME`.
+- PQEDITOR_SCALE=1.5 reproduces the user's 150% display in the native
+  app; PQEDITOR_SCALE=1.5 under wine does the same there.
+
+With a CLEAN rig (fixed grab, real native app, 1.5x), all three
+round-5 reports verified FIXED: gap clicks select the nearest cell,
+the editor box fits its row with centered legible text, separators
+render continuously. User-side re-confirmation pending.
+
+1. Gap clicks: verified fixed at 1.5x on the native app (grab-diff).
+   If the user still sees failures, check the title stamp first, then
+   investigate winit's real-DPI path (PQEDITOR_SCALE forces ppp after
+   creation; winit on Windows computes it from the monitor).
+2. Cell editor box: verified fixed at 1.5x on the native app (theme
+   TextEdit min height + frame margin exceeded the row height; margin
+   clamped to fit).
+3. Status error lingers on the status bar's right even after a later
+   successful action overwrote app.status (error has display priority).
+   Clear app.error when a new action succeeds.
+4. Enter-to-edit appends to the old value (caret at end). Needs
+   select-all-on-open or an empty-editor start; egui has no public
+   select-all API, plumb TextCursorState.
+5. Edit under sort keeps the row's old position until the next sort;
+   the header arrow then disagrees with the visible order.
+
 KNOWN LEFTOVERS (candidates for next round):
 - app.error lingers on the status bar's right even after a later
   successful action overwrote app.status (error has display priority).
