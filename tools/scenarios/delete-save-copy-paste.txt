@@ -1,0 +1,21 @@
+# After a save that removed rows, copy/paste near the tail still works:
+# positions the new view has must resolve, and the cache total follows.
+open <PARQUET>
+wait-open
+page0
+click-row 0
+press-del
+wait-count 99
+save
+wait-save
+page0
+click 95 0
+copy
+click 90 0
+paste 97
+assert-cell 90 0 97
+assert-overlay 1
+save
+wait-save
+assert-cell 90 0 97
+assert-total 99

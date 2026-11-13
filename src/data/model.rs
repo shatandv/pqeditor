@@ -385,25 +385,35 @@ impl GridState {
     /// positions; missing (unfetched) cells come out empty; dropped columns
     /// and deleted rows are skipped. Returns None for an empty or
     /// oversized selection.
-    pub fn copy_rect(&mut self, sel: &Sel, max_cells: usize) -> Option<String> {
+    /// Copy the selection as TSV. Fails loudly (Err) instead of silently
+    /// producing a short/partial clip when the selection spans rows that
+    /// are not fetched yet or the block exceeds the copy cap — a silent
+    /// partial clip leaves the OLD clipboard in place and a later paste
+    /// then replays stale data (user-visible as "transposed" pastes).
+    pub fn copy_rect(&mut self, sel: &Sel, max_cells: usize) -> Result<String, String> {
         let ncols = self.schema.len();
         let (r0, r1, c0, c1) = sel.rect(self.cache.total(), ncols);
         if r1 < r0 || c1 < c0 {
-            return None;
+            return Err("empty selection".into());
         }
         let nrows = (r1 - r0 + 1) as usize;
         let ncols_n = c1 - c0 + 1;
         if nrows.saturating_mul(ncols_n) > max_cells {
-            return None;
+            return Err("selection too large to copy (max 1,000,000 cells)".into());
+        }
+        for r in r0..=r1 {
+            let rowid = self.rowid_at(r);
+            let deleted = rowid.is_some_and(|id| self.overlay.is_row_deleted(id));
+            if rowid.is_none() || deleted {
+                return Err(if deleted {
+                    "selection contains a row deleted (unsaved)".into()
+                } else {
+                    "selection spans rows that are still loading — try again".into()
+                });
+            }
         }
         let mut out = String::new();
         for r in r0..=r1 {
-            if self
-                .rowid_at(r)
-                .is_none_or(|id| self.overlay.is_row_deleted(id))
-            {
-                continue;
-            }
             let mut line = String::new();
             for c in c0..=c1 {
                 if self.overlay.is_col_deleted(c) {
@@ -424,7 +434,7 @@ impl GridState {
         }
         // Drop the trailing newline.
         out.pop();
-        Some(out)
+        Ok(out)
     }
 
     /// True while row pages are still being fetched.
@@ -533,5 +543,76 @@ mod tests {
         assert_eq!(o.len(), 3);
         o.clear();
         assert!(o.is_empty());
+    }
+
+    /// A copyable grid: one page fetched, rows i -> (i, "s{i}").
+    fn copy_grid() -> GridState {
+        use crate::data::types::{ColType, ColumnSchema};
+        let mut g = GridState::new(vec![
+            ColumnSchema {
+                name: "a".into(),
+                ty: ColType::Integer,
+            },
+            ColumnSchema {
+                name: "b".into(),
+                ty: ColType::Text,
+            },
+        ]);
+        g.cache.clear(1, PAGE_SIZE as u64 * 2);
+        let p0: Vec<PageRow> = (0..PAGE_SIZE as i64).map(|i| (i as u64, val(i))).collect();
+        assert!(g.cache.put_page(1, 0, p0));
+        g
+    }
+
+    fn sel_at(anchor: (u64, usize), head: (u64, usize)) -> Sel {
+        Sel {
+            anchor: Cell {
+                pos: anchor.0,
+                col: anchor.1,
+            },
+            head: Cell {
+                pos: head.0,
+                col: head.1,
+            },
+        }
+    }
+
+    #[test]
+    fn copy_vertical_block_is_column_tsv() {
+        let mut g = copy_grid();
+        let text = g.copy_rect(&sel_at((0, 0), (2, 0)), 1_000_000).unwrap();
+        assert_eq!(text, "0\n1\n2");
+        // A 2x2 block copies both columns row-wise.
+        let text = g.copy_rect(&sel_at((0, 0), (1, 1)), 1_000_000).unwrap();
+        assert_eq!(text, "0\ts0\n1\ts1");
+    }
+
+    #[test]
+    fn copy_with_unfetched_row_fails_loudly() {
+        let mut g = copy_grid();
+        // Page 1 is not fetched: position PAGE_SIZE+1 is in it.
+        let r = g.copy_rect(
+            &sel_at((PAGE_SIZE as u64 - 1, 0), (PAGE_SIZE as u64 + 1, 0)),
+            1_000_000,
+        );
+        let err = r.expect_err("unfetched rows must fail, not copy partial data");
+        assert!(err.contains("still loading"), "{err}");
+    }
+
+    #[test]
+    fn copy_with_deleted_row_in_selection_fails_loudly() {
+        let mut g = copy_grid();
+        g.overlay.delete_rows(1..2);
+        let r = g.copy_rect(&sel_at((0, 0), (2, 0)), 1_000_000);
+        let err = r.expect_err("a pending-deleted row must fail the copy");
+        assert!(err.contains("deleted"), "{err}");
+    }
+
+    #[test]
+    fn copy_too_large_fails_loudly() {
+        let mut g = copy_grid();
+        let r = g.copy_rect(&sel_at((0, 0), (PAGE_SIZE as u64 * 2, 0)), 10);
+        let err = r.expect_err("over-cap copy must fail");
+        assert!(err.contains("too large"), "{err}");
     }
 }

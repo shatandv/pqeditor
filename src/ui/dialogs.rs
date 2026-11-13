@@ -122,12 +122,22 @@ fn filter_popover(ctx: &egui::Context, app: &mut App) -> bool {
         None => return false,
     };
 
-    let mut close_requested = false;
     let mut apply_requested = false;
     let mut clear_requested = false;
 
+    // The window-open flag lives in the popover state: a fresh local false
+    // made the window never render while the state stayed `Some` (which
+    // also gated copy/paste forever — the user-visible "filter values does
+    // nothing, then clipboard breaks" report).
+    let mut window_open = app
+        .file
+        .as_ref()
+        .and_then(|f| f.popover.as_ref())
+        .map(|p| p.open)
+        .unwrap_or(false);
+
     egui::Window::new(format!("filter · {name}"))
-        .open(&mut close_requested)
+        .open(&mut window_open)
         .resizable(false)
         .collapsible(false)
         .default_width(280.0)
@@ -228,7 +238,8 @@ fn filter_popover(ctx: &egui::Context, app: &mut App) -> bool {
             });
         });
 
-    if close_requested && let Some(f) = app.file.as_mut() {
+    // X button on the window title bar: drop the popover state.
+    if !window_open && let Some(f) = app.file.as_mut() {
         f.popover = None;
     }
     if apply_requested {

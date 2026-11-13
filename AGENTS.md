@@ -294,6 +294,15 @@ VERIFICATION TOOLING (rebuild if /tmp was wiped):
   the frame outline. eframe __screenshot saves a white buffer here.
 
 KNOWN LEFTOVERS (candidates for next round):
+- app.error lingers on the status bar's right even after a later
+  successful action overwrote app.status (error has display priority).
+  Clear app.error when a new action succeeds.
+- Enter-to-edit opens the editor with the caret at the end, so typing
+  appends to the old value (observed repeatedly under Wine). egui has
+  no public select-all-on-open API; either plumb TextCursorState or
+  open editors empty on Enter.
+- Edit under sort keeps the row's old position until the next explicit
+  sort; the header's arrow then disagrees with the visible order.
 - Wine keyboard focus flakiness is harness-side, but the app could
   re-request focus after clicks if real Windows shows anything similar.
 - Unsaved-changes confirm dialog renders (logic verified round 1); the

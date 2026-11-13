@@ -1,0 +1,22 @@
+# The header "filter values" popover: pick values, apply -> the column
+# filter is the IN-fragment and the shown count follows. Opening it must
+# not gate copy/paste (the never-rendering-popover regression).
+open <PARQUET>
+wait-open
+page0
+popover 0
+popover-check 3
+popover-check 7
+popover-apply
+wait-count 2
+assert-count 2
+popover-close
+popover 0
+popover-check-null
+popover-apply
+wait-count 0
+assert-count 0
+popover-close
+filter-clear
+wait-count 100
+assert-count 100

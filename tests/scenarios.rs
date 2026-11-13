@@ -45,19 +45,48 @@ fn make_parquet2(path: &Path, rows: i64) {
     .unwrap();
 }
 
+/// Grouped two-column file: grp = i % 5 (repeats), val = i — for
+/// multi-column sort pins.
+fn make_parquet3(path: &Path, rows: i64) {
+    let conn = duckdb::Connection::open_in_memory().unwrap();
+    conn.execute_batch(&format!(
+        "COPY (SELECT i % 5 AS grp, i AS val FROM range({rows}) t(i)) TO {}",
+        pqeditor::data::types::sql_quote(&path.to_string_lossy())
+    ))
+    .unwrap();
+}
+
+fn fixture(name: &str, which: u8, rows: i64) -> (PathBuf, PathBuf, Option<PathBuf>) {
+    let dir = tmp(&format!("{name}-fx{which}"));
+    let p1 = dir.join("one.parquet");
+    let p2 = dir.join("two.parquet");
+    let p3 = dir.join("grp.parquet");
+    match which {
+        1 => make_parquet1(&p1, rows),
+        2 => make_parquet2(&p2, rows),
+        3 => make_parquet3(&p3, rows),
+        _ => unreachable!(),
+    }
+    (p1, p2, Some(p3))
+}
+
 /// Read a scenario from tools/scenarios and substitute the file tokens.
-fn load_scenario(name: &str, p1: &Path, p2: Option<&Path>) -> String {
+fn load_scenario(name: &str, p1: &Path, p2: Option<&Path>, p3: Option<&Path>) -> String {
     let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let text =
         std::fs::read_to_string(repo.join("tools/scenarios").join(name)).expect("scenario file");
-    let token1 = "<PARQUET>".to_string();
-    let token2 = "<PARQUET2>".to_string();
+    let fallback = || "nonexistent.parquet".to_string();
     text.replace(
-        &token2,
-        &p2.map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|| "nonexistent.parquet".into()),
+        "<PARQUET3>",
+        &p3.map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(fallback),
     )
-    .replace(&token1, &p1.to_string_lossy())
+    .replace(
+        "<PARQUET2>",
+        &p2.map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(fallback),
+    )
+    .replace("<PARQUET>", &p1.to_string_lossy())
 }
 
 /// Fail with the scenario's failure description and a state dump.
@@ -114,149 +143,136 @@ fn run_with_deadline(app: &mut App, scenario: &str, text: &str) -> Option<String
     None
 }
 
-#[test]
-fn scenario_drag_select() {
-    let dir = tmp("drag-select");
-    let p1 = dir.join("one.parquet");
-    make_parquet1(&p1, 100);
-    let text = load_scenario("drag-select.txt", &p1, None);
+/// Run one scenario file against a fresh app + worker.
+type DiskCheck<'a> = Option<&'a dyn Fn(&Path, &Path)>;
+
+fn run_scenario(name: &str, which: u8, rows: i64, on_disk: DiskCheck<'_>) {
+    let (p1, p2, p3) = fixture(name, which, rows);
+    let text = load_scenario(name, &p1, Some(&p2), p3.as_deref());
     let engine = Engine::spawn().unwrap();
     let mut app = App::with_engine(engine, Vec::new());
-    let r = run_with_deadline(&mut app, "drag-select", &text);
-    expect_pass("drag-select", r, &app);
+    let r = run_with_deadline(&mut app, name, &text);
+    expect_pass(name, r, &app);
+    if let Some(check) = on_disk {
+        check(&p1, &p2);
+    }
 }
 
-#[test]
-fn scenario_set_null() {
-    let dir = tmp("set-null");
-    let p1 = dir.join("one.parquet");
-    make_parquet1(&p1, 100);
-    let text = load_scenario("set-null.txt", &p1, None);
-    let engine = Engine::spawn().unwrap();
-    let mut app = App::with_engine(engine, Vec::new());
-    let r = run_with_deadline(&mut app, "set-null", &text);
-    expect_pass("set-null", r, &app);
-    // The file now holds NULL in row 2.
+fn parquet_count(path: &Path, extra: &str) -> i64 {
     let conn = duckdb::Connection::open_in_memory().unwrap();
-    let nulls: i64 = conn
-        .query_row(
-            &format!(
-                "SELECT count(*) FROM read_parquet({}) WHERE id IS NULL",
-                pqeditor::data::types::sql_quote(&p1.to_string_lossy())
-            ),
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(nulls, 1);
-}
-
-#[test]
-fn scenario_edit_rejected() {
-    let dir = tmp("edit-rejected");
-    let p1 = dir.join("one.parquet");
-    make_parquet1(&p1, 100);
-    let text = load_scenario("edit-rejected.txt", &p1, None);
-    let engine = Engine::spawn().unwrap();
-    let mut app = App::with_engine(engine, Vec::new());
-    let r = run_with_deadline(&mut app, "edit-rejected", &text);
-    expect_pass("edit-rejected", r, &app);
+    conn.query_row(
+        &format!(
+            "SELECT count(*) FROM read_parquet({}) {}",
+            pqeditor::data::types::sql_quote(&path.to_string_lossy()),
+            extra
+        ),
+        [],
+        |r| r.get(0),
+    )
+    .unwrap()
 }
 
 #[test]
 fn scenario_edit_and_save() {
-    let dir = tmp("edit-save");
-    let p1 = dir.join("one.parquet");
-    make_parquet1(&p1, 100);
-    let text = load_scenario("edit-and-save.txt", &p1, None);
-    let engine = Engine::spawn().unwrap();
-    let mut app = App::with_engine(engine, Vec::new());
-    let r = run_with_deadline(&mut app, "edit-and-save", &text);
-    expect_pass("edit-and-save", r, &app);
+    run_scenario("edit-and-save.txt", 1, 100, None);
+}
+
+#[test]
+fn scenario_drag_select() {
+    run_scenario("drag-select.txt", 1, 100, None);
+}
+
+#[test]
+fn scenario_set_null() {
+    run_scenario(
+        "set-null.txt",
+        1,
+        100,
+        Some(&|p1: &Path, _| {
+            // The file now holds NULL in row 2.
+            assert_eq!(parquet_count(p1, "WHERE id IS NULL"), 1);
+        }),
+    );
+}
+
+#[test]
+fn scenario_edit_rejected() {
+    run_scenario("edit-rejected.txt", 1, 100, None);
 }
 
 #[test]
 fn scenario_sort_copy_paste() {
-    let dir = tmp("sort-copy-paste");
-    let p1 = dir.join("one.parquet");
-    make_parquet1(&p1, 100);
-    let text = load_scenario("sort-copy-paste.txt", &p1, None);
-    let engine = Engine::spawn().unwrap();
-    let mut app = App::with_engine(engine, Vec::new());
-    let r = run_with_deadline(&mut app, "sort-copy-paste", &text);
-    expect_pass("sort-copy-paste", r, &app);
+    run_scenario("sort-copy-paste.txt", 1, 100, None);
 }
 
 #[test]
 fn scenario_delete_rows() {
-    let dir = tmp("delete-rows");
-    let p1 = dir.join("one.parquet");
-    make_parquet1(&p1, 100);
-    let text = load_scenario("delete-rows.txt", &p1, None);
-    let engine = Engine::spawn().unwrap();
-    let mut app = App::with_engine(engine, Vec::new());
-    let r = run_with_deadline(&mut app, "delete-rows", &text);
-    expect_pass("delete-rows", r, &app);
-    // The file on disk lost exactly rows 0 and 1.
-    let conn = duckdb::Connection::open_in_memory().unwrap();
-    let n: i64 = conn
-        .query_row(
-            &format!(
-                "SELECT count(*) FROM read_parquet({})",
-                pqeditor::data::types::sql_quote(&p1.to_string_lossy())
-            ),
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(n, 98);
+    run_scenario(
+        "delete-rows.txt",
+        1,
+        100,
+        Some(&|p1: &Path, _| {
+            // The file on disk lost exactly rows 0 and 1.
+            assert_eq!(parquet_count(p1, ""), 98);
+        }),
+    );
 }
 
 #[test]
 fn scenario_filter_box() {
-    let dir = tmp("filter");
-    let p1 = dir.join("one.parquet");
-    make_parquet1(&p1, 100);
-    let text = load_scenario("filter-box.txt", &p1, None);
-    let engine = Engine::spawn().unwrap();
-    let mut app = App::with_engine(engine, Vec::new());
-    let r = run_with_deadline(&mut app, "filter-box", &text);
-    expect_pass("filter-box", r, &app);
+    run_scenario("filter-box.txt", 1, 100, None);
 }
 
 #[test]
 fn scenario_bad_filter() {
-    let dir = tmp("bad-filter");
-    let p1 = dir.join("one.parquet");
-    make_parquet1(&p1, 100);
-    let text = load_scenario("bad-filter.txt", &p1, None);
-    let engine = Engine::spawn().unwrap();
-    let mut app = App::with_engine(engine, Vec::new());
-    let r = run_with_deadline(&mut app, "bad-filter", &text);
-    expect_pass("bad-filter", r, &app);
+    run_scenario("bad-filter.txt", 1, 100, None);
 }
 
 #[test]
 fn scenario_drop_column() {
-    let dir = tmp("drop-col");
-    let p1 = dir.join("two.parquet");
-    make_parquet2(&p1, 100);
-    let text = load_scenario("drop-column.txt", &p1, Some(&p1));
-    let engine = Engine::spawn().unwrap();
-    let mut app = App::with_engine(engine, Vec::new());
-    let r = run_with_deadline(&mut app, "drop-column", &text);
-    expect_pass("drop-column", r, &app);
-    // On disk only the id column survives.
-    let conn = duckdb::Connection::open_in_memory().unwrap();
-    let cols: i64 = conn
-        .query_row(
-            &format!(
-                "SELECT count(*) FROM (DESCRIBE SELECT * FROM read_parquet({}))",
-                pqeditor::data::types::sql_quote(&p1.to_string_lossy())
-            ),
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(cols, 1);
+    run_scenario(
+        "drop-column.txt",
+        2,
+        100,
+        Some(&|_: &Path, p2: &Path| {
+            // On disk only the id column survives.
+            let conn = duckdb::Connection::open_in_memory().unwrap();
+            let cols: i64 = conn
+                .query_row(
+                    &format!(
+                        "SELECT count(*) FROM (DESCRIBE SELECT * FROM read_parquet({}))",
+                        pqeditor::data::types::sql_quote(&p2.to_string_lossy())
+                    ),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(cols, 1);
+        }),
+    );
+}
+
+#[test]
+fn scenario_save_then_copy_paste() {
+    run_scenario("save-then-copy-paste.txt", 1, 100, None);
+}
+
+#[test]
+fn scenario_delete_save_copy_paste() {
+    run_scenario("delete-save-copy-paste.txt", 1, 100, None);
+}
+
+#[test]
+fn scenario_paste_block() {
+    run_scenario("paste-block.txt", 2, 100, None);
+}
+
+#[test]
+fn scenario_multi_sort() {
+    run_scenario("multi-sort.txt", 3, 100, None);
+}
+
+#[test]
+fn scenario_filter_popover() {
+    run_scenario("filter-popover.txt", 1, 100, None);
 }

@@ -1,0 +1,24 @@
+# Copy/paste keeps working after a plain save (the stale-clipboard /
+# transposed-paste report). Copy a vertical 3x1 block, save, paste it
+# elsewhere: fills DOWN the column.
+open <PARQUET>
+wait-open
+page0
+press 0 0
+drag 2 0
+release
+copy
+edit 3 0 7
+save
+wait-save
+page0
+click 5 0
+paste 50\n51\n52
+assert-cell 5 0 50
+assert-cell 6 0 51
+assert-cell 7 0 52
+assert-overlay 3
+save
+wait-save
+assert-overlay 0
+assert-cell 5 0 50

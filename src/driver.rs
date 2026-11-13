@@ -58,6 +58,75 @@ pub fn run(app: &mut App, line: &str, out: &mut impl Write) -> Result<(), String
             app.set_sort(col, ascending);
             Ok(())
         }
+        ["sort-add", col, dir] => {
+            let col: usize = col.parse().map_err(|_| "bad column".to_string())?;
+            let ascending = parse_sort(dir)?;
+            app.add_sort(col, ascending);
+            Ok(())
+        }
+        ["sort-remove", col] => {
+            let col: usize = col.parse().map_err(|_| "bad column".to_string())?;
+            app.remove_sort_key(col);
+            Ok(())
+        }
+        ["popover", col] => {
+            let col: usize = col.parse().map_err(|_| "bad column".to_string())?;
+            let f = need_file(app)?;
+            f.popover = Some(crate::app::FilterPopover::new(col));
+            let filter = f.grid.filter.clone();
+            app.engine.send(crate::data::engine::Job::TopValues {
+                col,
+                limit: 200,
+                filter,
+            });
+            poll_until(
+                app,
+                |a| {
+                    a.file
+                        .as_ref()
+                        .and_then(|f| f.popover.as_ref())
+                        .map(|p| !p.loading)
+                        .unwrap_or(false)
+                },
+                "popover values",
+            )
+        }
+        ["popover-check", value @ ..] => {
+            let value = value.join(" ");
+            let f = need_file(app)?;
+            let pop = f
+                .popover
+                .as_mut()
+                .ok_or_else(|| "no popover open".to_string())?;
+            pop.checked.insert(value);
+            Ok(())
+        }
+        ["popover-check-null"] => {
+            let f = need_file(app)?;
+            let pop = f
+                .popover
+                .as_mut()
+                .ok_or_else(|| "no popover open".to_string())?;
+            pop.checked.insert(crate::app::NULL_SENTINEL.into());
+            Ok(())
+        }
+        ["popover-apply"] => {
+            app.apply_popover();
+            poll_until(
+                app,
+                |a| {
+                    a.file
+                        .as_ref()
+                        .map(|f| f.pending_filter.is_none())
+                        .unwrap_or(false)
+                },
+                "popover filter",
+            )
+        }
+        ["popover-close"] => {
+            need_file(app)?.popover = None;
+            Ok(())
+        }
         ["sort-append", col, dir] => {
             let col: usize = col.parse().map_err(|_| "bad column".to_string())?;
             let ascending = parse_sort(dir)?;
@@ -112,6 +181,13 @@ pub fn run(app: &mut App, line: &str, out: &mut impl Write) -> Result<(), String
             Ok(())
         }
         ["drag", pos, col] => {
+            let pos: u64 = pos.parse().map_err(|_| "bad pos".to_string())?;
+            let col: usize = col.parse().map_err(|_| "bad col".to_string())?;
+            need_file(app)?.pointer_on_cell(pos, col, false);
+            Ok(())
+        }
+        ["press", pos, col] => {
+            // Begin a pointer press on a cell (drag-select start).
             let pos: u64 = pos.parse().map_err(|_| "bad pos".to_string())?;
             let col: usize = col.parse().map_err(|_| "bad col".to_string())?;
             need_file(app)?.pointer_on_cell(pos, col, false);
@@ -185,11 +261,11 @@ pub fn run(app: &mut App, line: &str, out: &mut impl Write) -> Result<(), String
                 f.grid.copy_rect(sel, 1_000_000)
             };
             match text {
-                Some(t) => {
+                Ok(t) => {
                     let _ = writeln!(out, "copied: {t:?}");
                     Ok(())
                 }
-                None => fail("copy returned nothing".into()),
+                Err(msg) => fail(msg),
             }
         }
         ["save"] => {

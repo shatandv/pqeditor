@@ -116,6 +116,27 @@ impl FileState {
         self.set_sort(col, false);
     }
 
+    /// Add a sort key (or set its direction if the column is already in
+    /// the stack), keeping every other key: multi-column sort.
+    pub fn add_sort(&mut self, col: usize, ascending: bool) {
+        let mut sort = self.grid.sort.clone();
+        match sort.iter().position(|k| k.col == col) {
+            Some(i) => sort[i].ascending = ascending,
+            None => sort.push(SortKey { col, ascending }),
+        }
+        let filter = self.grid.filter.clone();
+        self.grid.requery(sort, filter);
+        self.selection = None;
+    }
+
+    /// Remove one column's key from the sort stack (keeps the rest).
+    pub fn remove_sort_key(&mut self, col: usize) {
+        let mut sort = self.grid.sort.clone();
+        sort.retain(|k| k.col != col);
+        let filter = self.grid.filter.clone();
+        self.grid.requery(sort, filter);
+    }
+
     /// Start editing the cell at a view position (type permitting).
     /// Deleted rows cannot be edited. The overlay is keyed by the row's
     /// true rowid, resolved through the cache.
@@ -330,6 +351,11 @@ pub struct FilterPopover {
     pub loading: bool,
     /// Checked value display-strings (including the null sentinel).
     pub checked: HashSet<String>,
+    /// egui `Window::open` flag: true while the window should show; the
+    /// title-bar X sets it false and the popover state is then dropped.
+    /// (A fresh local false made the window never render while the state
+    /// stayed `Some` — which also silently gated copy/paste forever.)
+    pub open: bool,
 }
 
 pub const NULL_SENTINEL: &str = "· null";
@@ -343,6 +369,7 @@ impl FilterPopover {
             truncated: false,
             loading: true,
             checked: HashSet::new(),
+            open: true,
         }
     }
 }
@@ -435,6 +462,42 @@ pub struct Recent {
     pub rows: u64,
 }
 
+/// One paste target: resolve position->rowid, validate the raw value.
+/// First rejection wins (`rejected`); every field is checked before any
+/// overlay write (all-or-nothing).
+fn push_target(
+    f: &mut FileState,
+    targets: &mut Vec<(u64, usize, EditValue)>,
+    rejected: &mut Option<String>,
+    pos: u64,
+    col: usize,
+    raw: &str,
+) {
+    let total = f.grid.cache.total();
+    if pos >= total {
+        rejected.get_or_insert_with(|| "paste overflows the row count".into());
+        return;
+    }
+    let Some(rowid) = f.grid.rowid_at(pos) else {
+        rejected.get_or_insert_with(|| "row still loading".to_string());
+        return;
+    };
+    let Some(schema) = f.grid.schema.get(col) else {
+        return;
+    };
+    if !schema.ty.editable() {
+        return;
+    }
+    match crate::data::types::validate_edit(schema.ty, raw) {
+        Ok(val) => targets.push((rowid, col, val)),
+        Err(msg) => {
+            rejected.get_or_insert_with(|| format!("col '{}': {msg}", schema.name));
+        }
+    }
+}
+
+/// All-or-nothing: every field is validated BEFORE anything is
+/// applied, so a type error never leaves a half-applied paste.
 impl App {
     /// Headless constructor for tests and tool binaries.
     pub fn with_engine(engine: Engine, recents: Vec<Recent>) -> Self {
@@ -663,6 +726,22 @@ impl App {
         self.refresh_count();
     }
 
+    /// Add a key to the sort stack (header menu / shift+click semantics).
+    pub fn add_sort(&mut self, col: usize, ascending: bool) {
+        if let Some(f) = self.file.as_mut() {
+            f.add_sort(col, ascending);
+        }
+        self.refresh_count();
+    }
+
+    /// Drop one column's key from the sort stack (header menu).
+    pub fn remove_sort_key(&mut self, col: usize) {
+        if let Some(f) = self.file.as_mut() {
+            f.remove_sort_key(col);
+        }
+        self.refresh_count();
+    }
+
     /// After any requery (sort/filter change): the grid reads its row count
     /// from the cache, which requery resets — so always send a fresh
     /// `count(*)` for the current filter.
@@ -798,11 +877,9 @@ impl App {
         self.status = format!("{} rows deleted (unsaved)", n);
     }
 
-    /// Paste a TSV block (or a single value, which fills the whole
-    /// selection) anchored at the selection's top-left corner.
-    /// All-or-nothing: every field is validated BEFORE anything is
-    /// applied, so a type error never leaves a half-applied paste.
     pub fn paste_tsv(&mut self, text: &str) {
+        // Paste a TSV block (or a single value, which fills the whole
+        // selection) anchored at the selection's top-left corner.
         let Some(f) = self.file.as_mut() else { return };
         let Some(sel) = f.selection else { return };
         let total = f.grid.cache.total();
@@ -817,41 +894,21 @@ impl App {
         // touches the overlay until every field validated.
         let mut targets: Vec<(u64, usize, EditValue)> = Vec::new();
         let mut rejected: Option<String> = None;
-        for (i, line) in lines.iter().enumerate() {
-            let fields: Vec<&str> = if one_cell {
-                // A single value fills every cell of the selection rect.
-                let width = c1 - c0 + 1;
-                let height = (r1 - r0 + 1) as usize;
-                let mut v = Vec::new();
-                for _ in 0..height {
-                    v.extend(std::iter::repeat_n(line, width));
+        if one_cell {
+            // A single value fills every cell of the selection rect:
+            // TILE the rect (rows x cols), do not run the value across a
+            // single row — that transposed a vertical selection.
+            let width = c1 - c0 + 1;
+            let height = (r1 - r0 + 1) as usize;
+            for i in 0..height as u64 {
+                for j in 0..width {
+                    push_target(f, &mut targets, &mut rejected, r0 + i, c0 + j, lines[0]);
                 }
-                v
-            } else {
-                line.split('\t').collect()
-            };
-            for (j, raw) in fields.iter().enumerate() {
-                let pos = r0 + i as u64;
-                let col = c0 + j;
-                if pos >= total {
-                    rejected.get_or_insert_with(|| "paste overflows the row count".into());
-                    break;
-                }
-                let Some(rowid) = f.grid.rowid_at(pos) else {
-                    rejected.get_or_insert_with(|| "row still loading".to_string());
-                    continue;
-                };
-                let Some(schema) = f.grid.schema.get(col) else {
-                    continue;
-                };
-                if !schema.ty.editable() {
-                    continue;
-                }
-                match crate::data::types::validate_edit(schema.ty, raw) {
-                    Ok(val) => targets.push((rowid, col, val)),
-                    Err(msg) => {
-                        rejected.get_or_insert_with(|| format!("col '{}': {msg}", schema.name));
-                    }
+            }
+        } else {
+            for (i, line) in lines.iter().enumerate() {
+                for (j, raw) in line.split('\t').enumerate() {
+                    push_target(f, &mut targets, &mut rejected, r0 + i as u64, c0 + j, raw);
                 }
             }
         }
@@ -1022,8 +1079,12 @@ impl App {
                                 // filter. Rowids of the surviving rows are
                                 // unchanged, so pages stay valid, and the
                                 // file's row count is now the view count.
+                                // The cache total must follow: a stale one
+                                // made tail copy/paste address positions
+                                // the new view no longer has.
                                 if let Some(f) = self.file.as_mut() {
                                     f.total_rows = f.grid.shown_rows;
+                                    f.grid.cache.set_total(f.grid.shown_rows);
                                 }
                                 self.engine.send(Job::SetDeletedRows { rows: vec![] });
                             }

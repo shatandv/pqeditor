@@ -306,16 +306,23 @@ impl App {
     }
 
     fn copy_selection(&mut self, ctx: &egui::Context) {
-        let text = self.file.as_mut().and_then(|f| {
-            f.selection
-                .as_ref()
-                .and_then(|sel| f.grid.copy_rect(sel, 1_000_000))
+        let copied = self.file.as_mut().and_then(|f| {
+            let sel = f.selection.as_ref()?;
+            Some(f.grid.copy_rect(sel, 1_000_000))
         });
-        if let Some(text) = text {
-            // egui's clipboard goes through eframe's own arboard instance;
-            // the Paste event reads the same clipboard back.
-            ctx.copy_text(text);
-            self.status = "copied".into();
+        match copied {
+            Some(Ok(text)) => {
+                // egui's clipboard goes through eframe's own arboard instance;
+                // the Paste event reads the same clipboard back.
+                ctx.copy_text(text);
+                self.status = "copied".into();
+            }
+            Some(Err(msg)) => {
+                // Fail loudly: a silent failure leaves the OLD clipboard in
+                // place and the next paste replays stale data.
+                self.error = Some(msg);
+            }
+            None => {}
         }
     }
 }

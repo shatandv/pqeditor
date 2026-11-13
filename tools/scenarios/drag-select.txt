@@ -3,7 +3,7 @@
 open <PARQUET>
 wait-open
 page0
-click 1 0
+press 1 0
 drag 2 0
 drag 3 0
 release

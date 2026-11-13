@@ -1,0 +1,17 @@
+# Multi-column sort: add keys from the header menu (or shift+click),
+# keep other keys, and remove a key. Fixture: grp = i % 5, val = i.
+open <PARQUET3>
+wait-open
+page0
+sort-add 0 asc
+sort-add 1 desc
+page0
+assert-cell 0 0 0
+assert-cell 0 1 95
+assert-cell 1 1 90
+assert-cell 19 1 0
+assert-cell 20 0 1
+assert-cell 20 1 96
+sort-remove 0
+page0
+assert-cell 0 1 99

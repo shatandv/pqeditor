@@ -27,6 +27,8 @@ const COL_DEFAULT_WIDTH: f32 = 130.0;
 enum HeaderEvent {
     Sort { col: usize, append: bool },
     SortDesc { col: usize },
+    SortAdd { col: usize, ascending: bool },
+    SortRemove { col: usize },
     Filter { col: usize },
     Stats { col: usize },
     CopyName { col: usize },
@@ -161,6 +163,14 @@ pub fn draw(ui: &mut Ui, app: &mut App) {
             }
             HeaderEvent::SortDesc { col } => {
                 file.set_sort_desc(col);
+                sorted = true;
+            }
+            HeaderEvent::SortAdd { col, ascending } => {
+                file.add_sort(col, ascending);
+                sorted = true;
+            }
+            HeaderEvent::SortRemove { col } => {
+                file.remove_sort_key(col);
                 sorted = true;
             }
             HeaderEvent::Filter { col } => {
@@ -310,6 +320,24 @@ fn draw_header_cell(
         }
         if ui.button("sort descending").clicked() {
             events.push(HeaderEvent::SortDesc { col });
+            ui.close();
+        }
+        if ui.button("add to sort ascending").clicked() {
+            events.push(HeaderEvent::SortAdd {
+                col,
+                ascending: true,
+            });
+            ui.close();
+        }
+        if ui.button("add to sort descending").clicked() {
+            events.push(HeaderEvent::SortAdd {
+                col,
+                ascending: false,
+            });
+            ui.close();
+        }
+        if sort.iter().any(|k| k.col == col) && ui.button("remove from sort").clicked() {
+            events.push(HeaderEvent::SortRemove { col });
             ui.close();
         }
         if ui.button("filter values\u{2026}").clicked() {
