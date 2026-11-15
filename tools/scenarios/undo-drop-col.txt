@@ -1,0 +1,20 @@
+# Undo/redo of a column drop: the column returns with the pending edits
+# the drop had purged; redo re-drops (and re-purges).
+open <PARQUET2>
+wait-open
+page0
+assert-cell 5 1 item_5
+edit 5 1 zz
+assert-overlay 1
+drop 1
+assert-overlay 1
+undo
+assert-overlay 1
+assert-cell 5 1 zz
+assert-status undo: drop column label
+redo
+assert-overlay 1
+assert-status redo: drop column label
+undo
+assert-cell 5 1 zz
+assert-history 1

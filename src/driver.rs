@@ -333,6 +333,22 @@ pub fn run(app: &mut App, line: &str, out: &mut impl Write) -> Result<(), String
             app.save();
             Ok(())
         }
+        ["undo"] => {
+            app.undo();
+            Ok(())
+        }
+        ["redo"] => {
+            app.redo();
+            Ok(())
+        }
+        ["assert-history", n] => {
+            let n: usize = n.parse().map_err(|_| "bad number".to_string())?;
+            let got = need_file(app)?.history_undo_len();
+            if got != n {
+                return fail(format!("history = {got} entries (want {n})"));
+            }
+            Ok(())
+        }
         ["wait-save"] => poll_until(
             app,
             |a| {

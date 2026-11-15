@@ -1,0 +1,28 @@
+# Ctrl+Z / Ctrl+Shift+Z on cell edits: undo restores the pre-edit value
+# (no pending edit left behind), redo re-applies it. 100-row file id 0..99.
+open <PARQUET>
+wait-open
+assert-total 100
+page0
+assert-cell 3 0 3
+edit 3 0 500
+assert-overlay 1
+assert-cell 3 0 500
+assert-history 1
+undo
+assert-overlay 0
+assert-cell 3 0 3
+assert-status undo: edit cell
+redo
+assert-overlay 1
+assert-cell 3 0 500
+assert-status redo: edit cell
+# A new action after undo discards the redo stack.
+edit 4 0 600
+assert-cell 4 0 600
+undo
+assert-cell 4 0 4
+edit 5 0 700
+redo
+assert-status nothing to redo
+assert-cell 5 0 700

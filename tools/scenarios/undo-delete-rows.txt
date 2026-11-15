@@ -1,0 +1,33 @@
+# Undo/redo of row deletes: the worker view must follow (SetDeletedRows +
+# requery + count), rows return with their values, redo re-deletes.
+open <PARQUET>
+wait-open
+page0
+click-row 0
+shift-click-row 1
+press-del
+wait-count 98
+assert-count 98
+assert-total 100
+undo
+wait-count 100
+assert-count 100
+assert-total 100
+assert-overlay 0
+page0
+assert-cell 0 0 0
+assert-cell 1 0 1
+assert-status undo: delete 2 rows
+redo
+wait-count 98
+assert-count 98
+assert-overlay 2
+assert-status redo: delete 2 rows
+# Undo again (delete undone), then a NEW action clears the redo stack.
+undo
+wait-count 100
+page0
+edit 5 0 555
+redo
+assert-status nothing to redo
+assert-overlay 1

@@ -62,6 +62,14 @@ pub enum Job {
     Open { path: PathBuf },
     /// Replace the worker's deleted-row set (and therefore the view).
     SetDeletedRows { rows: Vec<u64> },
+    /// Find a rowid's view position under the current sort/filter, for
+    /// jumping to the row an undo touched when its page is not cached.
+    Locate {
+        epoch: u64,
+        rowid: u64,
+        sort: Vec<SortKey>,
+        filter: Option<String>,
+    },
     /// Rewrite the open file with the overlay applied (atomic tmp+rename).
     /// `drop_cols` are schema indices of user-deleted columns.
     Save {
@@ -86,6 +94,13 @@ pub enum JobResult {
         total: u64,
     },
     Rows(RowBatch),
+    /// Answer to Job::Locate: `pos` is the view position, None when the
+    /// rowid is outside the current view (filtered out).
+    Located {
+        epoch: u64,
+        rowid: u64,
+        pos: Option<u64>,
+    },
     Stats(ColumnStats),
     TopValues {
         col: usize,
@@ -306,6 +321,46 @@ impl Worker {
             sql.push_str(&keys.join(", "));
         }
         sql
+    }
+
+    /// View position of a rowid under the current sort/filter, for the
+    /// undo/redo jump when the row's page is not cached. None = filtered
+    /// out of the view.
+    fn locate(&self, rowid: u64, sort: &[SortKey], filter: Option<&str>) -> Result<Option<u64>> {
+        // The position must follow the view order, so the ORDER BY lives
+        // inside the window function (an outer ORDER BY applies after
+        // row_number() and would leave file-order positions).
+        let over = if sort.is_empty() {
+            "OVER ()".to_string()
+        } else {
+            let keys: Vec<String> = sort
+                .iter()
+                .map(|k| {
+                    let col = self
+                        .schema
+                        .get(k.col)
+                        .map(|c| sql_ident(&c.name))
+                        .unwrap_or_else(|| "__rowid".to_string());
+                    format!("{col} {}", if k.ascending { "ASC" } else { "DESC" })
+                })
+                .collect();
+            format!("OVER (ORDER BY {})", keys.join(", "))
+        };
+        let where_clause = match filter {
+            Some(f) => format!(" WHERE {f}"),
+            None => String::new(),
+        };
+        let sql = format!(
+            "SELECT pos FROM (SELECT __rowid, row_number() {over} - 1 AS pos FROM {}{}) WHERE __rowid = {rowid}",
+            self.view_name(),
+            where_clause
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query([])?;
+        Ok(match rows.next()? {
+            Some(r) => Some(r.get::<_, i64>(0)? as u64),
+            None => None,
+        })
     }
 
     fn count(&self, filter: Option<&str>) -> Result<u64> {
@@ -876,6 +931,7 @@ fn worker_loop(
             Job::Open { .. } => "open",
             Job::Count { .. } => "count",
             Job::Rows { .. } => "rows",
+            Job::Locate { .. } => "locate",
             Job::Stats { .. } => "stats",
             Job::TopValues { .. } => "top_values",
             Job::SetDeletedRows { .. } => "set_deleted_rows",
@@ -914,6 +970,18 @@ fn worker_loop(
                 filter,
             } => match worker.rows(epoch, page, &sort, filter.as_deref()) {
                 Ok(batch) => JobResult::Rows(batch),
+                Err(e) => JobResult::Failed {
+                    source: FailSource::Rows,
+                    message: short_error(e),
+                },
+            },
+            Job::Locate {
+                epoch,
+                rowid,
+                sort,
+                filter,
+            } => match worker.locate(rowid, &sort, filter.as_deref()) {
+                Ok(pos) => JobResult::Located { epoch, rowid, pos },
                 Err(e) => JobResult::Failed {
                     source: FailSource::Rows,
                     message: short_error(e),
@@ -1422,6 +1490,53 @@ mod deletion_tests {
             )
             .unwrap();
         assert_eq!(n, 97);
+    }
+
+    #[test]
+    fn locate_finds_rowid_view_position() {
+        // The undo/redo jump: under a descending id sort, rowid 8 sits
+        // at view position 91 (id 99 is first); position 8 in file order.
+        let dir = tmp("locate");
+        let path = dir.join("t.parquet");
+        make_parquet(&path, 100);
+        let engine = Engine::spawn().unwrap();
+        engine.send(Job::Open { path: path.clone() });
+        assert!(matches!(recv(&engine), JobResult::Opened { .. }));
+
+        engine.send(Job::Locate {
+            epoch: 0,
+            rowid: 8,
+            sort: vec![SortKey {
+                col: 0,
+                ascending: false,
+            }],
+            filter: None,
+        });
+        match recv(&engine) {
+            JobResult::Located { pos, .. } => assert_eq!(pos, Some(91)),
+            other => panic!("expected Located, got {other:?}"),
+        }
+        engine.send(Job::Locate {
+            epoch: 0,
+            rowid: 8,
+            sort: vec![],
+            filter: None,
+        });
+        match recv(&engine) {
+            JobResult::Located { pos, .. } => assert_eq!(pos, Some(8)),
+            other => panic!("expected Located, got {other:?}"),
+        }
+        // Filtered out of the view: None, no error.
+        engine.send(Job::Locate {
+            epoch: 0,
+            rowid: 8,
+            sort: vec![],
+            filter: Some("id > 50".to_string()),
+        });
+        match recv(&engine) {
+            JobResult::Located { pos, .. } => assert_eq!(pos, None),
+            other => panic!("expected Located, got {other:?}"),
+        }
     }
 
     #[test]

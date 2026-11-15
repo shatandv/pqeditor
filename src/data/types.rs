@@ -92,6 +92,18 @@ impl CellValue {
     }
 }
 
+impl CellValue {
+    /// The `EditValue` that reproduces this value through the engine's
+    /// edit pipeline (the engine casts the text back to the column type;
+    /// `display()` round-trips for every editable type).
+    pub fn to_edit_value(&self) -> EditValue {
+        match self {
+            CellValue::Null => EditValue::Null,
+            v => EditValue::Text(v.display()),
+        }
+    }
+}
+
 /// Compact float formatting: no trailing `.0`, no scientific notation for
 /// ordinary magnitudes. Mirrors what DuckDB prints.
 pub fn format_float(v: f64) -> String {

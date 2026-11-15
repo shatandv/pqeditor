@@ -199,6 +199,24 @@ impl App {
             }
             return;
         }
+        // Undo / redo. While a cell editor is open the focused TextEdit
+        // consumes Ctrl+Z for its own text history, which is the right
+        // granularity; these fire only when focus is free.
+        let (undo_key, redo_keys) = ctx.input(|i| {
+            (
+                i.modifiers.ctrl && !i.modifiers.shift && i.key_pressed(Key::Z),
+                (i.modifiers.ctrl && i.modifiers.shift && i.key_pressed(Key::Z))
+                    || (i.modifiers.ctrl && i.key_pressed(Key::Y)),
+            )
+        });
+        if undo_key {
+            self.undo();
+            return;
+        }
+        if redo_keys {
+            self.redo();
+            return;
+        }
         if self.file.is_none() {
             return;
         }

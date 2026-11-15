@@ -46,6 +46,8 @@ pub struct FileState {
     pub commit_error: Option<String>,
     /// Cell where a drag-select started; None when not dragging.
     pub drag_select: Option<Cell>,
+    /// Undo/redo history for this file (data changes only).
+    pub history: History,
 }
 
 impl FileState {
@@ -68,6 +70,7 @@ impl FileState {
             visible_rows: None,
             commit_error: None,
             drag_select: None,
+            history: History::default(),
         }
     }
 
@@ -278,13 +281,105 @@ impl FileState {
         if self.grid.overlay.is_col_deleted(col) {
             return;
         }
+        // Capture the edits this drop will purge so undo can restore them.
+        let purged: Vec<(u64, EditValue)> = self
+            .grid
+            .overlay
+            .all()
+            .filter(|(_, c, _)| *c == col)
+            .map(|(r, _, v)| (r, v.clone()))
+            .collect();
+        let name = self
+            .grid
+            .schema
+            .get(col)
+            .map(|s| s.name.clone())
+            .unwrap_or_else(|| format!("column {col}"));
         self.grid.overlay.drop_col(col);
         self.selection = None;
+        self.push_history(HistoryEntry {
+            label: format!("drop column {name}"),
+            undo: vec![OverlayOp::UndropCol {
+                col,
+                purged: purged.clone(),
+            }],
+            redo: vec![OverlayOp::DropCol { col, purged }],
+            focus_rowid: None,
+        });
     }
 
     /// Commit the active edit: validate against the column type, store in
     /// the overlay. Unchanged text is a no-op. On validation failure the
     /// editor stays open and the error is recorded.
+    /// Record an undoable action. Lives on FileState so capture points
+    /// inside its methods can push directly.
+    pub fn push_history(&mut self, entry: HistoryEntry) {
+        self.history.push(entry);
+    }
+
+    /// Test/driver introspection: entries available for undo.
+    pub fn history_undo_len(&self) -> usize {
+        self.history.undo_len()
+    }
+
+    /// Apply a list of overlay operations (either direction of a history
+    /// entry). Returns true when the worker's deleted-row view must be
+    /// synced (rows marked or unmarked).
+    pub fn apply_ops(&mut self, ops: &[OverlayOp]) -> bool {
+        let mut structural = false;
+        for op in ops {
+            match op {
+                OverlayOp::SetCell {
+                    rowid,
+                    col,
+                    pending,
+                    ..
+                } => match pending {
+                    Some(v) => self.grid.overlay.set(*rowid, *col, v.clone()),
+                    None => self.grid.overlay.remove(*rowid, *col),
+                },
+                OverlayOp::DeleteRows { rowids } => {
+                    self.grid.overlay.delete_rows(rowids.iter().copied());
+                    structural = true;
+                }
+                OverlayOp::RestoreRows { rowids } => {
+                    for r in rowids {
+                        self.grid.overlay.deleted_rows.remove(r);
+                    }
+                    structural = true;
+                }
+                OverlayOp::DropCol { col, .. } => {
+                    self.grid.overlay.drop_col(*col);
+                }
+                OverlayOp::UndropCol { col, purged } => {
+                    self.grid.overlay.deleted_cols.remove(col);
+                    for (rowid, v) in purged {
+                        self.grid.overlay.set(*rowid, *col, v.clone());
+                    }
+                }
+            }
+        }
+        structural
+    }
+
+    /// Undo the newest action: apply its inverse ops and park it on the
+    /// redo stack. Returns (label, rows-marked-or-unmarked, focus rowid)
+    /// for the App to sync the worker, jump the view and report status.
+    pub fn undo(&mut self) -> Option<(String, bool, Option<u64>)> {
+        let entry = self.history.pop_undo()?;
+        let structural = self.apply_ops(&entry.undo);
+        self.history.park_redo(entry.clone());
+        Some((entry.label, structural, entry.focus_rowid))
+    }
+
+    /// Redo the most recently undone action. Same contract as `undo`.
+    pub fn redo(&mut self) -> Option<(String, bool, Option<u64>)> {
+        let entry = self.history.pop_redo()?;
+        let structural = self.apply_ops(&entry.redo);
+        self.history.park_undo(entry.clone());
+        Some((entry.label, structural, entry.focus_rowid))
+    }
+
     pub fn commit_editing(&mut self) {
         self.commit_error = None;
         let Some(edit) = self.editing.clone() else {
@@ -301,8 +396,34 @@ impl FileState {
         }
         match crate::data::types::validate_edit(schema.ty, &edit.text) {
             Ok(val) => {
-                self.grid.overlay.set(edit.rowid, edit.col, val);
+                // Capture the pre-commit state for undo: the pending edit
+                // if any, plus the disk value for the post-save rewrite.
+                let old = self.grid.overlay.get(edit.rowid, edit.col).cloned();
+                let disk = match &old {
+                    Some(v) => v.clone(),
+                    None => match self.grid.cell(edit.pos, edit.col).map(|c| c.value) {
+                        Some(v) => v.to_edit_value(),
+                        None => EditValue::Null,
+                    },
+                };
+                self.grid.overlay.set(edit.rowid, edit.col, val.clone());
                 self.editing = None;
+                self.push_history(HistoryEntry {
+                    label: "edit cell".into(),
+                    undo: vec![OverlayOp::SetCell {
+                        rowid: edit.rowid,
+                        col: edit.col,
+                        pending: old,
+                        disk,
+                    }],
+                    redo: vec![OverlayOp::SetCell {
+                        rowid: edit.rowid,
+                        col: edit.col,
+                        pending: Some(val),
+                        disk: EditValue::Null,
+                    }],
+                    focus_rowid: Some(edit.rowid),
+                });
             }
             Err(msg) => self.commit_error = Some(msg),
         }
@@ -420,6 +541,122 @@ pub struct PendingSave {
     pub edits: Vec<(u64, usize, EditValue)>,
     /// Sort/filter to restore after the re-open (SchemaChanged).
     pub carry: Option<(Vec<SortKey>, Option<String>)>,
+}
+
+/// One inverse operation. Both directions of a history entry are stored
+/// as op lists; applying a list mutates only the overlay, so undo never
+/// touches the worker or the file.
+#[derive(Debug, Clone)]
+pub enum OverlayOp {
+    /// Set or clear one pending cell edit. `pending` is the pre-action
+    /// overlay state; `disk` is the value as it was on disk at capture
+    /// time. A plain save rewrites the file, after which "no pending
+    /// edit" is no longer expressible as the before-state — Done{Save}
+    /// rewrites such ops to `pending = Some(disk)` so undo re-creates
+    /// the old value as a pending edit and the next save reverts it.
+    SetCell {
+        rowid: u64,
+        col: usize,
+        pending: Option<EditValue>,
+        disk: EditValue,
+    },
+    /// Mark rows deleted (redo of a delete).
+    DeleteRows { rowids: Vec<u64> },
+    /// Unmark rows (undo of a delete).
+    RestoreRows { rowids: Vec<u64> },
+    /// Drop a column, purging its pending edits (they are stored here so
+    /// the inverse can restore them).
+    DropCol {
+        col: usize,
+        purged: Vec<(u64, EditValue)>,
+    },
+    /// Restore a dropped column and its purged edits.
+    UndropCol {
+        col: usize,
+        purged: Vec<(u64, EditValue)>,
+    },
+}
+
+/// One undoable user action: label for the status bar, inverse op lists
+/// for both directions, and the row to jump to after applying.
+#[derive(Debug, Clone)]
+pub struct HistoryEntry {
+    pub label: String,
+    pub undo: Vec<OverlayOp>,
+    pub redo: Vec<OverlayOp>,
+    pub focus_rowid: Option<u64>,
+}
+
+/// Per-file undo/redo stacks. Structural saves (rows/columns changed on
+/// disk) clear both: the rowids the entries reference are gone.
+#[derive(Default)]
+pub struct History {
+    undo: Vec<HistoryEntry>,
+    redo: Vec<HistoryEntry>,
+}
+
+/// Comfortable amount of history; entries are tiny (rowid + value).
+const HISTORY_CAP: usize = 200;
+
+impl History {
+    /// Record a new action: the redo stack is discarded and the oldest
+    /// entry evicted past the cap.
+    pub fn push(&mut self, entry: HistoryEntry) {
+        self.redo.clear();
+        self.undo.push(entry);
+        if self.undo.len() > HISTORY_CAP {
+            let excess = self.undo.len() - HISTORY_CAP;
+            self.undo.drain(..excess);
+        }
+    }
+
+    pub fn pop_undo(&mut self) -> Option<HistoryEntry> {
+        self.undo.pop()
+    }
+
+    /// An undone entry parks here until redone or displaced.
+    pub fn park_redo(&mut self, entry: HistoryEntry) {
+        self.redo.push(entry);
+    }
+
+    pub fn pop_redo(&mut self) -> Option<HistoryEntry> {
+        self.redo.pop()
+    }
+
+    /// A parked entry returns to the undo stack (after redo).
+    pub fn park_undo(&mut self, entry: HistoryEntry) {
+        self.undo.push(entry);
+        if self.undo.len() > HISTORY_CAP {
+            let excess = self.undo.len() - HISTORY_CAP;
+            self.undo.drain(..excess);
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.undo.clear();
+        self.redo.clear();
+    }
+
+    pub fn undo_len(&self) -> usize {
+        self.undo.len()
+    }
+
+    /// A plain save rewrote the file in place: for entries whose
+    /// before-state was "no pending edit", that state can no longer be
+    /// reached by clearing the overlay (the file now holds the edited
+    /// value). Re-express it as a pending edit equal to the disk value.
+    pub fn on_plain_save(&mut self) {
+        for entry in &mut self.undo {
+            for op in &mut entry.undo {
+                match op {
+                    OverlayOp::SetCell { pending, disk, .. } if pending.is_none() => {
+                        *pending = Some(disk.clone());
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
 }
 
 pub struct App {
@@ -765,6 +1002,63 @@ impl App {
         }
     }
 
+    /// Ctrl+Z: undo the newest action. Overlay-only, except row changes
+    /// which sync the worker's view like delete_selected_rows does.
+    pub fn undo(&mut self) {
+        let Some(f) = self.file.as_mut() else { return };
+        f.commit_error = None;
+        let Some((label, structural, focus)) = f.undo() else {
+            self.status = "nothing to undo".into();
+            return;
+        };
+        self.after_history_step(structural, focus, &format!("undo: {label}"));
+    }
+
+    /// Ctrl+Shift+Z / Ctrl+Y.
+    pub fn redo(&mut self) {
+        let Some(f) = self.file.as_mut() else { return };
+        f.commit_error = None;
+        let Some((label, structural, focus)) = f.redo() else {
+            self.status = "nothing to redo".into();
+            return;
+        };
+        self.after_history_step(structural, focus, &format!("redo: {label}"));
+    }
+
+    /// Shared tail: worker sync for row changes, then jump to the first
+    /// affected row (cached pages answer directly; otherwise the worker
+    /// locates the rowid under the current sort/filter).
+    fn after_history_step(&mut self, structural: bool, focus: Option<u64>, status: &str) {
+        if structural && let Some(f) = self.file.as_mut() {
+            let rows: Vec<u64> = f.grid.overlay.deleted_rows.iter().copied().collect();
+            let sort = f.grid.sort.clone();
+            let filter = f.grid.filter.clone();
+            f.grid.requery(sort, filter);
+            f.selection = None;
+            self.engine.send(Job::SetDeletedRows { rows });
+            self.refresh_count();
+        }
+        if let Some(rowid) = focus
+            && let Some(f) = self.file.as_mut()
+        {
+            match f.grid.cache.find_rowid(rowid) {
+                Some(pos) => f.scroll_to_row = Some(ScrollRequest::Center(pos)),
+                None => {
+                    let epoch = f.grid.cache.epoch();
+                    let sort = f.grid.sort.clone();
+                    let filter = f.grid.filter.clone();
+                    self.engine.send(Job::Locate {
+                        epoch,
+                        rowid,
+                        sort,
+                        filter,
+                    });
+                }
+            }
+        }
+        self.status = status.to_string();
+    }
+
     pub fn apply_popover(&mut self) {
         // Snapshot the popover state, then release the borrow before
         // requerying.
@@ -843,16 +1137,66 @@ impl App {
         let Some(sel) = f.selection else { return };
         let total = f.grid.cache.total();
         let (r0, r1, c0, c1) = sel.rect(total, f.grid.schema.len());
+        // Capture the before-state of every affected cell, then apply.
+        let mut undo_ops: Vec<OverlayOp> = Vec::new();
+        let mut redo_ops: Vec<OverlayOp> = Vec::new();
         for r in r0..=r1 {
             let Some(rowid) = f.grid.rowid_at(r) else {
                 continue;
             };
             for c in c0..=c1 {
                 if f.grid.schema.get(c).is_some_and(|s| s.ty.editable()) {
-                    f.grid.overlay.set(rowid, c, EditValue::Null);
+                    let old = f.grid.overlay.get(rowid, c).cloned();
+                    if old.as_ref().is_some_and(|v| matches!(v, EditValue::Null)) {
+                        continue; // already NULL here: no change, no entry
+                    }
+                    let disk = match &old {
+                        Some(v) => v.clone(),
+                        None => match f.grid.cell(r, c).map(|cell| cell.value) {
+                            Some(v) => v.to_edit_value(),
+                            None => continue,
+                        },
+                    };
+                    undo_ops.push(OverlayOp::SetCell {
+                        rowid,
+                        col: c,
+                        pending: old,
+                        disk,
+                    });
+                    redo_ops.push(OverlayOp::SetCell {
+                        rowid,
+                        col: c,
+                        pending: Some(EditValue::Null),
+                        disk: EditValue::Null,
+                    });
                 }
             }
         }
+        if undo_ops.is_empty() {
+            return;
+        }
+        let focus = undo_ops.first().and_then(|op| match op {
+            OverlayOp::SetCell { rowid, .. } => Some(*rowid),
+            _ => None,
+        });
+        for op in &redo_ops {
+            if let OverlayOp::SetCell {
+                rowid,
+                col,
+                pending: Some(v),
+                ..
+            } = op
+            {
+                f.grid.overlay.set(*rowid, *col, v.clone());
+            }
+        }
+        let n = undo_ops.len();
+        f.push_history(HistoryEntry {
+            label: format!("clear {n} cells"),
+            undo: undo_ops,
+            redo: redo_ops,
+            focus_rowid: focus,
+        });
     }
 
     /// Delete the selected rows (whole-row selection): the overlay marks
@@ -876,6 +1220,19 @@ impl App {
             f.grid.overlay.delete_rows(rows.iter().copied());
             f.grid.overlay.deleted_rows.iter().copied().collect()
         };
+        if let Some(first) = rows.first() {
+            let f = self.file.as_mut().unwrap();
+            f.push_history(HistoryEntry {
+                label: format!("delete {} rows", rows.len()),
+                undo: vec![OverlayOp::RestoreRows {
+                    rowids: rows.clone(),
+                }],
+                redo: vec![OverlayOp::DeleteRows {
+                    rowids: rows.clone(),
+                }],
+                focus_rowid: Some(*first),
+            });
+        }
         let Some(f) = self.file.as_mut() else { return };
         let sort = f.grid.sort.clone();
         let filter = f.grid.filter.clone();
@@ -927,9 +1284,47 @@ impl App {
             return;
         }
         let applied = targets.len();
+        // One history entry for the whole paste: undo restores the
+        // pre-paste state of every target cell.
+        let mut undo_ops: Vec<OverlayOp> = Vec::with_capacity(applied);
+        let mut redo_ops: Vec<OverlayOp> = Vec::with_capacity(applied);
+        for (rowid, col, val) in &targets {
+            let old = f.grid.overlay.get(*rowid, *col).cloned();
+            let disk = match &old {
+                Some(v) => v.clone(),
+                None => match f
+                    .grid
+                    .cache
+                    .find_rowid(*rowid)
+                    .and_then(|pos| f.grid.cell(pos, *col).map(|c| c.value))
+                {
+                    Some(v) => v.to_edit_value(),
+                    None => EditValue::Null,
+                },
+            };
+            undo_ops.push(OverlayOp::SetCell {
+                rowid: *rowid,
+                col: *col,
+                pending: old,
+                disk,
+            });
+            redo_ops.push(OverlayOp::SetCell {
+                rowid: *rowid,
+                col: *col,
+                pending: Some(val.clone()),
+                disk: val.clone(),
+            });
+        }
+        let focus = targets.first().map(|(r, _, _)| *r);
         for (rowid, col, val) in targets {
             f.grid.overlay.set(rowid, col, val);
         }
+        f.push_history(HistoryEntry {
+            label: format!("paste {applied} cells"),
+            undo: undo_ops,
+            redo: redo_ops,
+            focus_rowid: focus,
+        });
         self.status = format!("pasted {} cells", applied);
     }
 
@@ -1039,6 +1434,14 @@ impl App {
                         );
                     }
                 }
+                JobResult::Located { epoch, pos, .. } => {
+                    if let Some(f) = self.file.as_mut()
+                        && epoch == f.grid.cache.epoch()
+                        && let Some(pos) = pos
+                    {
+                        f.scroll_to_row = Some(ScrollRequest::Center(pos));
+                    }
+                }
                 JobResult::Stats(s) => {
                     if let Some(f) = self.file.as_mut() {
                         f.stats.retain(|old| old.col != s.col);
@@ -1081,27 +1484,41 @@ impl App {
                                     f.grid.patch_saved_edits(
                                         &pending.map(|p| p.edits).unwrap_or_default(),
                                     );
+                                    // History survives a plain save, but
+                                    // "no pending edit" as a before-state
+                                    // is gone: the file now holds the
+                                    // edited values.
+                                    f.history.on_plain_save();
                                 }
                             }
                             Some(SaveOutcome::RowsChanged) => {
                                 // The saved file no longer contains the
-                                // deleted rows; clear the worker's view
-                                // filter. Rowids of the surviving rows are
-                                // unchanged, so pages stay valid, and the
-                                // file's row count is now the view count.
-                                // The cache total must follow: a stale one
-                                // made tail copy/paste address positions
-                                // the new view no longer has.
+                                // deleted rows, and the rewrite COMPACTED
+                                // the rowids: the view numbers rows by
+                                // position over the new file, so the
+                                // pre-save rowid labels in the page cache
+                                // are stale and any edit keyed off them
+                                // would land below the intended row.
+                                // Requery so pages refetch with fresh
+                                // labels; the row count is unchanged.
                                 if let Some(f) = self.file.as_mut() {
                                     f.total_rows = f.grid.shown_rows;
-                                    f.grid.cache.set_total(f.grid.shown_rows);
+                                    let sort = f.grid.sort.clone();
+                                    let filter = f.grid.filter.clone();
+                                    f.grid.requery(sort, filter);
+                                    // History entries reference rowids
+                                    // the rewrite eliminated: dropped.
+                                    f.history.clear();
                                 }
                                 self.engine.send(Job::SetDeletedRows { rows: vec![] });
+                                self.refresh_count();
                             }
                             Some(SaveOutcome::SchemaChanged) => {
                                 // The on-disk schema changed: re-open.
                                 // pending_save (with its carry snapshot)
                                 // stays until the Opened reply consumes it.
+                                // The re-open replaces FileState, so the
+                                // history dies with it; nothing to carry.
                                 if let Some(f) = self.file.as_ref() {
                                     let path = f.path.clone();
                                     self.opening = Some(path.clone());
@@ -1332,6 +1749,431 @@ mod app_tests {
         assert_eq!(app.file.as_ref().unwrap().grid.cache.total(), 98);
     }
 
+    // A RowsChanged save rewrites the file compacted: the deleted rows
+    // are gone and every surviving row's TRUE rowid is renumbered (the
+    // view counts row_number over the new file). The page cache still
+    // holds pre-save rowid labels, so any edit keyed off rowid_at would
+    // land rows BELOW the intended target. Requery so pages refetch with
+    // fresh labels; the count already round-trips through refresh_count.
+    #[test]
+    fn edit_after_delete_save_lands_on_the_row_you_see() {
+        let dir = tmp("edit-after-delsave");
+        let path = dir.join("t.parquet");
+        make_parquet(&path, 100);
+        let app = &mut App::with_engine(Engine::spawn().unwrap(), Vec::new());
+        app.open_path(path.clone());
+        drain(app);
+        load_page0(app);
+
+        // Delete rows 0..=1 and wait for the count.
+        let f = app.file.as_mut().unwrap();
+        f.click_rownum(0, false);
+        f.click_rownum(1, true);
+        app.delete_selected_rows();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            app.poll();
+            if app.file.as_ref().unwrap().grid.shown_rows == 98 {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "count never updated");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // The GUI refetches page 0 after the delete's requery.
+        load_page0(app);
+        app.save();
+        wait_save(app);
+        // The RowsChanged requery cleared the pages; the GUI draw loop
+        // refetches them.
+        load_page0(app);
+
+        // Edit the first visible position exactly as a cell edit does:
+        // the overlay is keyed by the rowid the cache reports.
+        let rowid = app.file.as_mut().unwrap().grid.rowid_at(0).unwrap();
+        app.file
+            .as_mut()
+            .unwrap()
+            .grid
+            .overlay
+            .set(rowid, 0, EditValue::Text("777".into()));
+        app.save();
+        wait_save(app);
+
+        assert_eq!(parquet_int_count(&path, "id = 777"), 1);
+        // The edit must have replaced the row the user saw (id=2), not a
+        // row further down the compacted file.
+        assert_eq!(parquet_int_count(&path, "id = 2"), 0);
+        assert_eq!(parquet_int_count(&path, "id = 3"), 1);
+        assert_eq!(parquet_int_count(&path, "id = 4"), 1);
+        assert_eq!(parquet_row_count(&path), 98);
+    }
+
+    /// Drive a cell edit exactly as the UI and the scenario driver do.
+    fn edit_cell(app: &mut App, pos: u64, col: usize, text: &str) {
+        let f = app.file.as_mut().unwrap();
+        f.begin_edit_at(pos, col);
+        match f.editing.as_mut() {
+            Some(e) => e.text = text.to_string(),
+            None => panic!("editor did not open at ({pos},{col})"),
+        }
+        f.commit_editing();
+    }
+
+    /// Wait until the view count settles on `n` (requery + count round-trip).
+    fn wait_count(app: &mut App, n: u64) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            app.poll();
+            if app.file.as_ref().map(|f| f.grid.shown_rows) == Some(n) {
+                return;
+            }
+            assert!(std::time::Instant::now() < deadline, "count never hit {n}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn undo_and_redo_cell_edit() {
+        let dir = tmp("undo-edit");
+        let path = dir.join("t.parquet");
+        make_parquet(&path, 100);
+        let app = &mut App::with_engine(Engine::spawn().unwrap(), Vec::new());
+        app.open_path(path);
+        drain(app);
+        load_page0(app);
+
+        edit_cell(app, 3, 0, "500");
+        assert_eq!(app.file.as_ref().unwrap().grid.overlay.len(), 1);
+        app.undo();
+        let f = app.file.as_mut().unwrap();
+        assert_eq!(
+            f.grid.cell(3, 0).unwrap().value,
+            CellValue::Int(3),
+            "undo must restore the pre-edit value"
+        );
+        assert_eq!(f.grid.overlay.len(), 0, "no pending edit on disk truth");
+        assert_eq!(app.status, "undo: edit cell");
+        app.redo();
+        assert_eq!(
+            app.file.as_mut().unwrap().grid.cell(3, 0).unwrap().value,
+            CellValue::Int(500)
+        );
+        assert_eq!(app.status, "redo: edit cell");
+    }
+
+    #[test]
+    fn undo_cell_edit_after_plain_save_restores_old_value() {
+        // Plain saves keep history. After the save the "before" state is
+        // no longer "no pending edit" but "pending edit equal to the disk
+        // value", so undoing shows the old value AND the next save
+        // reverts the file.
+        let dir = tmp("undo-edit-plain-save");
+        let path = dir.join("t.parquet");
+        make_parquet(&path, 100);
+        let app = &mut App::with_engine(Engine::spawn().unwrap(), Vec::new());
+        app.open_path(path.clone());
+        drain(app);
+        load_page0(app);
+
+        edit_cell(app, 3, 0, "500");
+        app.save();
+        wait_save(app);
+        assert_eq!(parquet_int_count(&path, "id = 500"), 1);
+
+        app.undo();
+        assert_eq!(
+            app.file.as_mut().unwrap().grid.cell(3, 0).unwrap().value,
+            CellValue::Int(3),
+            "the view shows the pre-edit value"
+        );
+        assert_eq!(
+            app.file.as_ref().unwrap().grid.overlay.len(),
+            1,
+            "pre-save the before-state was disk truth; post-save it can only be re-expressed as a pending edit"
+        );
+        app.save();
+        wait_save(app);
+        assert_eq!(parquet_int_count(&path, "id = 500"), 0, "file reverted");
+        assert_eq!(parquet_row_count(&path), 100);
+    }
+
+    #[test]
+    fn undo_redo_set_null() {
+        let dir = tmp("undo-null");
+        let path = dir.join("t.parquet");
+        make_parquet(&path, 100);
+        let app = &mut App::with_engine(Engine::spawn().unwrap(), Vec::new());
+        app.open_path(path);
+        drain(app);
+        load_page0(app);
+
+        {
+            let f = app.file.as_mut().unwrap();
+            f.pointer_on_cell(0, 0, false);
+            f.pointer_release();
+            f.click_cell(0, 0, false);
+            f.pointer_on_cell(1, 0, true);
+            f.pointer_release();
+            f.click_cell(1, 0, true);
+        }
+        app.set_cell_null();
+        assert!(matches!(
+            app.file.as_mut().unwrap().grid.cell(0, 0).unwrap().value,
+            CellValue::Null
+        ));
+        app.undo();
+        assert_eq!(
+            app.file.as_mut().unwrap().grid.cell(0, 0).unwrap().value,
+            CellValue::Int(0)
+        );
+        assert_eq!(
+            app.file.as_mut().unwrap().grid.cell(1, 0).unwrap().value,
+            CellValue::Int(1)
+        );
+        assert_eq!(app.file.as_ref().unwrap().grid.overlay.len(), 0);
+        app.redo();
+        assert!(matches!(
+            app.file.as_mut().unwrap().grid.cell(1, 0).unwrap().value,
+            CellValue::Null
+        ));
+    }
+
+    #[test]
+    fn undo_redo_paste_block() {
+        let dir = tmp("undo-paste");
+        let path = dir.join("t.parquet");
+        make_parquet2(&path, 100);
+        let app = &mut App::with_engine(Engine::spawn().unwrap(), Vec::new());
+        app.open_path(path);
+        drain(app);
+        load_page0(app);
+
+        {
+            let f = app.file.as_mut().unwrap();
+            f.pointer_on_cell(0, 0, false);
+            f.pointer_release();
+            f.click_cell(0, 0, false);
+        }
+        app.paste_tsv("77\tseven\n66\tsix");
+        assert_eq!(app.file.as_ref().unwrap().grid.overlay.len(), 4);
+        app.undo();
+        {
+            let f = app.file.as_mut().unwrap();
+            assert_eq!(f.grid.cell(0, 0).unwrap().value, CellValue::Int(0));
+            assert_eq!(
+                f.grid.cell(0, 1).unwrap().value,
+                CellValue::Text("item_0".into())
+            );
+            assert_eq!(f.grid.cell(1, 0).unwrap().value, CellValue::Int(1));
+            assert_eq!(f.grid.overlay.len(), 0);
+        }
+        app.redo();
+        assert_eq!(app.file.as_ref().unwrap().grid.overlay.len(), 4);
+    }
+
+    #[test]
+    fn undo_redo_delete_rows() {
+        // Undo of a delete must restore the rows in the worker's view too
+        // (SetDeletedRows + requery + count), mirroring delete_selected_rows.
+        let dir = tmp("undo-delrows");
+        let path = dir.join("t.parquet");
+        make_parquet(&path, 100);
+        let app = &mut App::with_engine(Engine::spawn().unwrap(), Vec::new());
+        app.open_path(path.clone());
+        drain(app);
+        load_page0(app);
+
+        {
+            let f = app.file.as_mut().unwrap();
+            f.click_rownum(0, false);
+            f.click_rownum(1, true);
+        }
+        app.delete_selected_rows();
+        wait_count(app, 98);
+        assert_eq!(parquet_row_count(&path), 100, "not saved yet");
+
+        app.undo();
+        wait_count(app, 100);
+        load_page0(app);
+        {
+            let f = app.file.as_mut().unwrap();
+            assert!(f.grid.overlay.is_empty());
+            assert_eq!(f.grid.cell(0, 0).unwrap().value, CellValue::Int(0));
+            assert_eq!(f.grid.cell(1, 0).unwrap().value, CellValue::Int(1));
+        }
+        app.redo();
+        wait_count(app, 98);
+        assert_eq!(app.file.as_ref().unwrap().grid.overlay.len(), 2);
+    }
+
+    #[test]
+    fn undo_redo_drop_col_restores_edits() {
+        let dir = tmp("undo-dropcol");
+        let path = dir.join("t.parquet");
+        make_parquet2(&path, 100);
+        let app = &mut App::with_engine(Engine::spawn().unwrap(), Vec::new());
+        app.open_path(path);
+        drain(app);
+        load_page0(app);
+
+        edit_cell(app, 5, 1, "zz");
+        app.file.as_mut().unwrap().drop_col(1);
+        assert_eq!(
+            app.file.as_ref().unwrap().grid.overlay.len(),
+            1,
+            "only the dropped column remains pending (its edit was purged)"
+        );
+
+        app.undo();
+        {
+            let f = app.file.as_mut().unwrap();
+            assert!(!f.grid.overlay.is_col_deleted(1));
+            assert_eq!(f.grid.overlay.len(), 1, "the purged edit is restored");
+            assert_eq!(
+                f.grid.cell(5, 1).unwrap().value,
+                CellValue::Text("zz".into())
+            );
+        }
+        app.redo();
+        assert!(app.file.as_ref().unwrap().grid.overlay.is_col_deleted(1));
+    }
+
+    #[test]
+    fn rowschanged_save_truncates_history() {
+        let dir = tmp("undo-trunc-rows");
+        let path = dir.join("t.parquet");
+        make_parquet(&path, 100);
+        let app = &mut App::with_engine(Engine::spawn().unwrap(), Vec::new());
+        app.open_path(path.clone());
+        drain(app);
+        load_page0(app);
+
+        {
+            let f = app.file.as_mut().unwrap();
+            f.click_rownum(0, false);
+            f.click_rownum(1, true);
+        }
+        app.delete_selected_rows();
+        wait_count(app, 98);
+        app.save();
+        wait_save(app);
+        // The file is rewritten compacted; stale rowids would corrupt
+        // undo. The stack is dropped entirely.
+        let before = app.file.as_ref().unwrap().grid.shown_rows;
+        app.undo();
+        assert_eq!(app.status, "nothing to undo");
+        assert_eq!(app.file.as_ref().unwrap().grid.shown_rows, before);
+        assert_eq!(parquet_row_count(&path), 98);
+    }
+
+    #[test]
+    fn schemachanged_save_truncates_history() {
+        let dir = tmp("undo-trunc-schema");
+        let path = dir.join("t.parquet");
+        make_parquet2(&path, 100);
+        let app = &mut App::with_engine(Engine::spawn().unwrap(), Vec::new());
+        app.open_path(path.clone());
+        drain(app);
+        load_page0(app);
+
+        edit_cell(app, 5, 1, "zz");
+        app.file.as_mut().unwrap().drop_col(1);
+        app.save();
+        wait_save(app);
+        // The SchemaChanged save re-opens the file; history must not
+        // survive the re-open either.
+        load_page0(app);
+        app.undo();
+        assert_eq!(app.status, "nothing to undo");
+    }
+
+    #[test]
+    fn new_action_clears_redo_stack() {
+        let dir = tmp("undo-redo-clear");
+        let path = dir.join("t.parquet");
+        make_parquet(&path, 100);
+        let app = &mut App::with_engine(Engine::spawn().unwrap(), Vec::new());
+        app.open_path(path);
+        drain(app);
+        load_page0(app);
+
+        edit_cell(app, 3, 0, "500");
+        app.undo();
+        edit_cell(app, 4, 0, "600");
+        app.redo();
+        assert_eq!(app.status, "nothing to redo");
+        assert_eq!(
+            app.file.as_mut().unwrap().grid.cell(4, 0).unwrap().value,
+            CellValue::Int(600)
+        );
+        // The undo stack still holds both edits, newest first.
+        app.undo();
+        assert_eq!(
+            app.file.as_mut().unwrap().grid.cell(4, 0).unwrap().value,
+            CellValue::Int(4)
+        );
+        app.undo();
+        assert_eq!(
+            app.file.as_mut().unwrap().grid.cell(3, 0).unwrap().value,
+            CellValue::Int(3)
+        );
+    }
+
+    #[test]
+    fn history_capped() {
+        let dir = tmp("undo-cap");
+        let path = dir.join("t.parquet");
+        make_parquet(&path, 100);
+        let app = &mut App::with_engine(Engine::spawn().unwrap(), Vec::new());
+        app.open_path(path);
+        drain(app);
+        load_page0(app);
+
+        for i in 0..210 {
+            edit_cell(app, 0, 0, &format!("{i}"));
+        }
+        assert_eq!(app.file.as_ref().unwrap().history_undo_len(), 200);
+        // Oldest entries were dropped: exactly 200 undos remain.
+        for _ in 0..200 {
+            app.undo();
+        }
+        app.undo();
+        assert_eq!(app.status, "nothing to undo");
+    }
+
+    #[test]
+    fn undo_jumps_to_affected_row() {
+        let dir = tmp("undo-jump");
+        let path = dir.join("t.parquet");
+        make_parquet(&path, 100);
+        let app = &mut App::with_engine(Engine::spawn().unwrap(), Vec::new());
+        app.open_path(path);
+        drain(app);
+        load_page0(app);
+
+        edit_cell(app, 50, 0, "777");
+        app.undo();
+        assert_eq!(
+            app.file.as_ref().unwrap().scroll_to_row,
+            Some(ScrollRequest::Center(50))
+        );
+    }
+
+    #[test]
+    fn undo_with_empty_stack_says_so() {
+        let dir = tmp("undo-empty");
+        let path = dir.join("t.parquet");
+        make_parquet(&path, 100);
+        let app = &mut App::with_engine(Engine::spawn().unwrap(), Vec::new());
+        app.open_path(path);
+        drain(app);
+        load_page0(app);
+        app.undo();
+        assert_eq!(app.status, "nothing to undo");
+        app.redo();
+        assert_eq!(app.status, "nothing to redo");
+    }
+
     #[test]
     fn save_with_dropped_col_reopens_with_carry() {
         // SchemaChanged arm: the re-open refreshes the schema and the
@@ -1458,7 +2300,8 @@ mod app_tests {
     }
 
     /// Wait until a Job::Save round-trip completed (overlay cleared and the
-    /// automatic re-open finished).
+    /// automatic re-open finished). RowsChanged saves now requery, so the
+    /// post-save count must also have round-tripped before state asserts.
     fn wait_save(app: &mut App) {
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
@@ -1470,7 +2313,7 @@ mod app_tests {
                 && app
                     .file
                     .as_ref()
-                    .map(|f| f.grid.overlay.is_empty())
+                    .map(|f| f.grid.overlay.is_empty() && !f.count_pending)
                     .unwrap_or(false);
             if done {
                 return;

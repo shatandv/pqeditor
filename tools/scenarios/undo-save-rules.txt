@@ -1,0 +1,31 @@
+# History survives a plain save but a save that deleted rows truncates it
+# (the file is rewritten compacted; stale rowids would corrupt undo).
+# No implicit file write on undo: everything stays in the overlay.
+open <PARQUET>
+wait-open
+page0
+# Plain save keeps history.
+edit 3 0 500
+save
+wait-save
+assert-overlay 0
+assert-cell 3 0 500
+assert-history 1
+undo
+assert-overlay 1
+assert-cell 3 0 3
+redo
+save
+wait-save
+# RowsChanged save truncates.
+click-row 0
+shift-click-row 1
+press-del
+wait-count 98
+save
+wait-save
+wait-count 98
+assert-count 98
+undo
+assert-status nothing to undo
+assert-count 98

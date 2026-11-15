@@ -70,6 +70,18 @@ impl RowCache {
         self.total
     }
 
+    /// View position of a true rowid, if its page is cached. Used to
+    /// scroll to the row an undo/redo touched.
+    pub fn find_rowid(&self, rowid: u64) -> Option<u64> {
+        self.pages.iter().find_map(|(page, (_, rows))| {
+            rows.as_ref().and_then(|rows| {
+                rows.iter()
+                    .position(|(r, _)| *r == rowid)
+                    .map(|idx| page * PAGE_SIZE as u64 + idx as u64)
+            })
+        })
+    }
+
     /// Which pages are missing for the visible range [from, to)?
     /// Marks returned pages in-flight so they are not re-requested.
     pub fn missing_pages(&mut self, from: u64, to: u64) -> Vec<u64> {
@@ -200,6 +212,16 @@ impl EditOverlay {
 
     pub fn set(&mut self, rowid: u64, col: usize, val: EditValue) {
         self.edits.entry(rowid).or_default().insert(col, val);
+    }
+
+    /// Drop one pending edit. The inverse of `set` for undo.
+    pub fn remove(&mut self, rowid: u64, col: usize) {
+        if let Some(m) = self.edits.get_mut(&rowid) {
+            m.remove(&col);
+            if m.is_empty() {
+                self.edits.remove(&rowid);
+            }
+        }
     }
 
     pub fn get(&self, rowid: u64, col: usize) -> Option<&EditValue> {

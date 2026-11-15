@@ -10,5 +10,7 @@ wait-count 98
 assert-count 98
 save
 wait-save
+# The RowsChanged save requeries; wait for the count to round-trip.
+wait-count 98
 assert-count 98
 assert-total 98

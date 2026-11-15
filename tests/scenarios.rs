@@ -286,3 +286,23 @@ fn scenario_editor_text() {
 fn scenario_filter_popover() {
     run_scenario("filter-popover.txt", 1, 100, None);
 }
+
+#[test]
+fn scenario_undo_edit() {
+    run_scenario("undo-edit.txt", 1, 100, None);
+}
+
+#[test]
+fn scenario_undo_delete_rows() {
+    run_scenario("undo-delete-rows.txt", 1, 100, None);
+}
+
+#[test]
+fn scenario_undo_save_rules() {
+    run_scenario("undo-save-rules.txt", 1, 100, None);
+}
+
+#[test]
+fn scenario_undo_drop_col() {
+    run_scenario("undo-drop-col.txt", 2, 100, None);
+}
