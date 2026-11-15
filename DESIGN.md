@@ -45,6 +45,11 @@ Save
   view is unchanged on screen (no reload, no flicker); after a save with
   dropped columns the schema refreshes and sort/filter carry over.
 - R14 Unsaved-changes confirmation on quit and on switching files.
+- R14a Undo (Ctrl+Z) / redo (Ctrl+Shift+Z, Ctrl+Y) with a comfortable
+  amount of history (200 actions). Undo never writes the user's file;
+  saving deletes or dropped columns ends the history for that file
+  (user-accepted trade-off). Sorts/filters are not undoable; the view
+  jumps to the row the last step touched.
 
 Status / feedback
 - R15 Status bar: total rows, filtered "shown" count, unsaved-edit
@@ -150,7 +155,38 @@ SaveOutcome { Plain, RowsChanged, SchemaChanged }
 - Rowids are stable across a plain save; positions are stable unless
   rows were deleted; the schema only changes with dropped columns.
 
-## 6. Interaction state machine (all pointer semantics)
+## 6. Undo/redo (command history, in-memory only)
+
+Per-file `History` on FileState: two stacks of `HistoryEntry` (label +
+inverse `OverlayOp` lists + focus rowid), capped at 200, redo stack
+cleared on every new action. Undo applies the undo ops to the overlay;
+redo applies the redo ops to the overlay. Nothing in the undo path
+touches the worker or the file — the data either exists in the overlay
+or the action is not undoable.
+
+- Capture points: commit_editing, set_cell_null, paste_tsv,
+  delete_selected_rows, drop_col. Row-delete entries are pure
+  rowid lists (edits on deleted rows survive in the overlay by design,
+  so restore needs nothing else); column-drop entries carry the purged
+  edits so undrop can put them back.
+- A row-change step (delete undo/redo) syncs the worker exactly like
+  delete_selected_rows: full deleted_rows set via SetDeletedRows +
+  requery + refresh_count. Column steps are overlay-only (the worker
+  never knows about deleted columns).
+- Save interaction: Plain keeps history; Done{Save} Plain rewrites
+  "pending = None" before-states into "pending = disk value" (the
+  pre-action state is no longer reachable by clearing the overlay).
+  RowsChanged/SchemaChanged truncate the history: the save renumbers
+  rowids or removes columns, and stale references would edit the wrong
+  rows. No remap machinery — truncation was chosen deliberately.
+- View jump: after every step, scroll Center to the first affected
+  rowid — cached pages answer directly, otherwise Job::Locate returns
+  the rowid's position under the current sort/filter (the ORDER BY
+  lives inside the window function; an outer one applies too late).
+- Keys: Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y in shell.rs, gated on focus-free
+  and no dialog; an open cell editor keeps Ctrl+Z for text-level undo.
+
+## 7. Interaction state machine (all pointer semantics)
 
 The grid draw closures call and the headless tests drive the same
 methods — one source of truth for "what a click does":
@@ -169,7 +205,7 @@ different places — pinned by history). The cell editor ignores its
 creation frame's Enter and commits on click-away only after it held
 focus (`had_focus`).
 
-## 7. Deterministic verification
+## 8. Deterministic verification
 
 - `cargo test` (unit + headless App scenarios + the committed scenario
   suite in tests/scenarios.rs) runs on every push via
@@ -191,7 +227,7 @@ focus (`had_focus`).
   any exe ships to the user. Cleanup of test windows/processes at the
   end is mandatory.
 
-## 8. Known open items
+## 9. Known open items
 
 - Modal surfaces (export dialog, confirm, context menus) render black
   under wine+glow here: environment artifact; verify on real Windows.

@@ -46,6 +46,16 @@ mockup.html      visual spec of the UI (open in a browser)
 
 ## Conventions
 
+- Undo/redo: history lives on FileState (`History` in app.rs, cap 200).
+  Capture points are commit_editing, set_cell_null, paste_tsv,
+  delete_selected_rows and drop_col; both directions are stored as
+  inverse `OverlayOp` lists applied to the overlay only. Plain saves
+  keep history (History::on_plain_save re-expresses "no pending edit"
+  before-states as pending disk values); RowsChanged/SchemaChanged
+  saves truncate it — the rowids/colids the entries reference are
+  physically gone. Row-change steps sync the worker like
+  delete_selected_rows (SetDeletedRows + requery + refresh_count).
+  Never push a file-write into undo: it stays in-memory by design.
 - egui 0.37 API quirks that matter here: `egui::CornerRadius` (not
   `Rounding`), `Frame::NONE` const, `Response::context_menu` +
   `ui.close()` for menus, `TableBuilder::body.rows` for the virtualized
