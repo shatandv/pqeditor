@@ -1125,6 +1125,12 @@ impl App {
 
     pub fn begin_edit(&mut self) {
         let Some(f) = self.file.as_mut() else { return };
+        // Enter/F2 while an editor is open must not recreate it: the
+        // grid's commit-on-Enter handles that key. Recreating reset
+        // created_frame, so Return could never commit the editor.
+        if f.editing.is_some() {
+            return;
+        }
         let Some(sel) = f.selection else { return };
         let (pos, col) = (sel.head.pos, sel.head.col);
         f.begin_edit_at(pos, col);
@@ -2172,6 +2178,40 @@ mod app_tests {
         assert_eq!(app.status, "nothing to undo");
         app.redo();
         assert_eq!(app.status, "nothing to redo");
+    }
+
+    // Enter/F2 while an editor is open must not recreate it: the grid's
+    // commit-on-Enter handles that key. This guard is why Return could
+    // never commit a keyboard-opened editor (the reopen reset
+    // created_frame, so the same key never reached the commit branch).
+    #[test]
+    fn enter_while_editing_does_not_reopen() {
+        let dir = tmp("enter-while-editing");
+        let path = dir.join("t.parquet");
+        make_parquet(&path, 100);
+        let app = &mut App::with_engine(Engine::spawn().unwrap(), Vec::new());
+        app.open_path(path);
+        drain(app);
+        load_page0(app);
+
+        {
+            let f = app.file.as_mut().unwrap();
+            f.pointer_on_cell(3, 0, false);
+            f.pointer_release();
+            f.click_cell(3, 0, false);
+            f.begin_edit_at(3, 0);
+            match f.editing.as_mut() {
+                Some(e) => e.text = "500".into(),
+                None => panic!("editor did not open"),
+            }
+        }
+        // What the F2/Enter key path calls.
+        app.begin_edit();
+        let f = app.file.as_mut().unwrap();
+        let e = f.editing.as_ref().expect("editor must stay open");
+        assert_eq!(e.text, "500", "the open editor must not be clobbered");
+        f.commit_editing();
+        assert_eq!(app.file.as_ref().unwrap().grid.overlay.len(), 1);
     }
 
     #[test]
