@@ -1,6 +1,6 @@
 //! Application state: windows, files, selection, edits, dialogs.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -48,6 +48,23 @@ pub struct FileState {
     pub drag_select: Option<Cell>,
     /// Undo/redo history for this file (data changes only).
     pub history: History,
+    /// Rows that exist only in the overlay until saved, keyed by their
+    /// synthetic rowid (file row count + counter, never collides with
+    /// real rowids).
+    pub new_rows: BTreeMap<u64, NewRow>,
+    /// Next synthetic rowid for an inserted row.
+    pub next_rowid: u64,
+    /// Set by an insert; the Located reply selects the new row's first
+    /// cell. Plain undo jumps do not set it.
+    pub pending_select: Option<u64>,
+}
+
+/// One unsaved inserted row: where it splices in, its sparse values
+/// (unlisted cells are NULL).
+#[derive(Debug, Clone)]
+pub struct NewRow {
+    pub anchor: crate::data::engine::RowAnchor,
+    pub values: BTreeMap<usize, EditValue>,
 }
 
 impl FileState {
@@ -71,6 +88,9 @@ impl FileState {
             commit_error: None,
             drag_select: None,
             history: History::default(),
+            new_rows: BTreeMap::new(),
+            next_rowid: total_rows,
+            pending_select: None,
         }
     }
 
@@ -322,6 +342,53 @@ impl FileState {
         self.history.undo_len()
     }
 
+    /// Allocate and register an unsaved new row (app or grid events);
+    /// the caller syncs the worker (SetNewRows + count + Locate).
+    pub fn begin_insert_row(&mut self, anchor: crate::data::engine::RowAnchor) -> u64 {
+        let rowid = self.next_rowid;
+        self.next_rowid += 1;
+        self.new_rows.insert(
+            rowid,
+            NewRow {
+                anchor,
+                values: BTreeMap::new(),
+            },
+        );
+        self.selection = None;
+        let sort = self.grid.sort.clone();
+        let filter = self.grid.filter.clone();
+        self.grid.requery(sort, filter);
+        self.push_history(HistoryEntry {
+            label: "add row".into(),
+            undo: vec![OverlayOp::RemoveRow { rowid }],
+            redo: vec![OverlayOp::AddRow {
+                rowid,
+                anchor,
+                values: vec![],
+            }],
+            focus_rowid: Some(rowid),
+        });
+        rowid
+    }
+
+    pub fn new_rows_len(&self) -> usize {
+        self.new_rows.len()
+    }
+
+    /// The worker payload for the current new-row set.
+    pub fn new_rows_spec(&self) -> Vec<crate::data::engine::NewRowSpec> {
+        self.new_rows
+            .iter()
+            .map(|(rowid, nr)| {
+                (
+                    *rowid,
+                    nr.anchor,
+                    nr.values.iter().map(|(c, v)| (*c, v.clone())).collect(),
+                )
+            })
+            .collect()
+    }
+
     /// Apply a list of overlay operations (either direction of a history
     /// entry). Returns true when the worker's deleted-row view must be
     /// synced (rows marked or unmarked).
@@ -356,6 +423,24 @@ impl FileState {
                     for (rowid, v) in purged {
                         self.grid.overlay.set(*rowid, *col, v.clone());
                     }
+                }
+                OverlayOp::AddRow {
+                    rowid,
+                    anchor,
+                    values,
+                } => {
+                    self.new_rows.insert(
+                        *rowid,
+                        NewRow {
+                            anchor: *anchor,
+                            values: values.iter().cloned().collect(),
+                        },
+                    );
+                    structural = true;
+                }
+                OverlayOp::RemoveRow { rowid } => {
+                    self.new_rows.remove(rowid);
+                    structural = true;
                 }
             }
         }
@@ -575,6 +660,14 @@ pub enum OverlayOp {
         col: usize,
         purged: Vec<(u64, EditValue)>,
     },
+    /// Insert an unsaved new row (redo of RemoveRow).
+    AddRow {
+        rowid: u64,
+        anchor: crate::data::engine::RowAnchor,
+        values: Vec<(usize, EditValue)>,
+    },
+    /// Remove an unsaved new row (undo of AddRow).
+    RemoveRow { rowid: u64 },
 }
 
 /// One undoable user action: label for the status bar, inverse op lists
@@ -691,7 +784,7 @@ impl App {
     pub fn dirty(&self) -> bool {
         self.file
             .as_ref()
-            .is_some_and(|f| !f.grid.overlay.is_empty())
+            .is_some_and(|f| !f.grid.overlay.is_empty() || !f.new_rows.is_empty())
     }
 }
 
@@ -820,7 +913,7 @@ impl App {
         let Some(file) = self.file.as_mut() else {
             return;
         };
-        if self.saving || file.grid.overlay.is_empty() {
+        if self.saving || (file.grid.overlay.is_empty() && file.new_rows.is_empty()) {
             return;
         }
         let overlay: Vec<(u64, usize, EditValue)> = file
@@ -832,7 +925,7 @@ impl App {
         let drop_cols: Vec<usize> = file.grid.overlay.deleted_cols.iter().copied().collect();
         let outcome = if !drop_cols.is_empty() {
             SaveOutcome::SchemaChanged
-        } else if !file.grid.overlay.deleted_rows.is_empty() {
+        } else if !file.grid.overlay.deleted_rows.is_empty() || !file.new_rows.is_empty() {
             SaveOutcome::RowsChanged
         } else {
             SaveOutcome::Plain
@@ -1002,6 +1095,33 @@ impl App {
         }
     }
 
+    /// Insert an unsaved new row. The worker's view unions it in at its
+    /// anchor; it becomes a real row at save.
+    pub fn insert_row(&mut self, anchor: crate::data::engine::RowAnchor) {
+        let (rowid, spec, epoch, sort, filter) = {
+            let Some(f) = self.file.as_mut() else { return };
+            let rowid = f.begin_insert_row(anchor);
+            (
+                rowid,
+                f.new_rows_spec(),
+                f.grid.cache.epoch(),
+                f.grid.sort.clone(),
+                f.grid.filter.clone(),
+            )
+        };
+        self.engine.send(Job::SetNewRows { rows: spec });
+        self.refresh_count();
+        self.engine.send(Job::Locate {
+            epoch,
+            rowid,
+            sort,
+            filter,
+        });
+        if let Some(f) = self.file.as_mut() {
+            f.pending_select = Some(rowid);
+        }
+    }
+
     /// Ctrl+Z: undo the newest action. Overlay-only, except row changes
     /// which sync the worker's view like delete_selected_rows does.
     pub fn undo(&mut self) {
@@ -1036,6 +1156,9 @@ impl App {
             f.grid.requery(sort, filter);
             f.selection = None;
             self.engine.send(Job::SetDeletedRows { rows });
+            self.engine.send(Job::SetNewRows {
+                rows: f.new_rows_spec(),
+            });
             self.refresh_count();
         }
         if let Some(rowid) = focus
@@ -1221,21 +1344,54 @@ impl App {
             let f = self.file.as_mut().unwrap();
             (r0..=r1).filter_map(|r| f.grid.rowid_at(r)).collect()
         };
+        // Not-yet-saved new rows are removed outright (they are not real
+        // rows yet); real rows are marked deleted in the overlay. A mixed
+        // selection produces one entry restoring both sides.
+        let (real, removed_new): (Vec<u64>, Vec<crate::data::engine::NewRowSpec>) = {
+            let f = self.file.as_mut().unwrap();
+            let mut real = Vec::new();
+            let mut removed_new = Vec::new();
+            for r in &rows {
+                match f.new_rows.remove(r) {
+                    Some(nr) => removed_new.push((
+                        *r,
+                        nr.anchor,
+                        nr.values.iter().map(|(c, v)| (*c, v.clone())).collect(),
+                    )),
+                    None => real.push(*r),
+                }
+            }
+            (real, removed_new)
+        };
         let all: Vec<u64> = {
             let f = self.file.as_mut().unwrap();
-            f.grid.overlay.delete_rows(rows.iter().copied());
+            f.grid.overlay.delete_rows(real.iter().copied());
             f.grid.overlay.deleted_rows.iter().copied().collect()
         };
         if let Some(first) = rows.first() {
+            let mut undo = Vec::new();
+            let mut redo = Vec::new();
+            if !real.is_empty() {
+                undo.push(OverlayOp::RestoreRows {
+                    rowids: real.clone(),
+                });
+                redo.push(OverlayOp::DeleteRows {
+                    rowids: real.clone(),
+                });
+            }
+            for (rowid, anchor, values) in &removed_new {
+                undo.push(OverlayOp::AddRow {
+                    rowid: *rowid,
+                    anchor: *anchor,
+                    values: values.clone(),
+                });
+                redo.push(OverlayOp::RemoveRow { rowid: *rowid });
+            }
             let f = self.file.as_mut().unwrap();
             f.push_history(HistoryEntry {
                 label: format!("delete {} rows", rows.len()),
-                undo: vec![OverlayOp::RestoreRows {
-                    rowids: rows.clone(),
-                }],
-                redo: vec![OverlayOp::DeleteRows {
-                    rowids: rows.clone(),
-                }],
+                undo,
+                redo,
                 focus_rowid: Some(*first),
             });
         }
@@ -1244,8 +1400,11 @@ impl App {
         let filter = f.grid.filter.clone();
         f.grid.requery(sort, filter);
         f.selection = None;
-        let n = all.len();
+        let n = all.len() + removed_new.len();
         self.engine.send(Job::SetDeletedRows { rows: all });
+        self.engine.send(Job::SetNewRows {
+            rows: f.new_rows_spec(),
+        });
         self.refresh_count();
         self.status = format!("{} rows deleted (unsaved)", n);
     }
@@ -1440,12 +1599,17 @@ impl App {
                         );
                     }
                 }
-                JobResult::Located { epoch, pos, .. } => {
+                JobResult::Located { epoch, rowid, pos } => {
                     if let Some(f) = self.file.as_mut()
                         && epoch == f.grid.cache.epoch()
                         && let Some(pos) = pos
                     {
                         f.scroll_to_row = Some(ScrollRequest::Center(pos));
+                        if f.pending_select == Some(rowid) {
+                            f.pending_select = None;
+                            f.click_cell(pos, 0, false);
+                            self.status = "row added (unsaved)".into();
+                        }
                     }
                 }
                 JobResult::Stats(s) => {
@@ -1512,11 +1676,16 @@ impl App {
                                     let sort = f.grid.sort.clone();
                                     let filter = f.grid.filter.clone();
                                     f.grid.requery(sort, filter);
+                                    // The inserted rows are real now;
+                                    // synthetic ids are gone.
+                                    f.new_rows.clear();
+                                    f.next_rowid = f.grid.shown_rows;
                                     // History entries reference rowids
                                     // the rewrite eliminated: dropped.
                                     f.history.clear();
                                 }
                                 self.engine.send(Job::SetDeletedRows { rows: vec![] });
+                                self.engine.send(Job::SetNewRows { rows: vec![] });
                                 self.refresh_count();
                             }
                             Some(SaveOutcome::SchemaChanged) => {
@@ -1592,6 +1761,7 @@ mod app_tests {
     //! Headless end-to-end tests for App-level flows (real worker).
 
     use super::*;
+    use crate::data::engine::RowAnchor;
     use crate::data::types::CellValue;
     use std::path::Path;
     use std::time::Duration;
@@ -2212,6 +2382,184 @@ mod app_tests {
         assert_eq!(e.text, "500", "the open editor must not be clobbered");
         f.commit_editing();
         assert_eq!(app.file.as_ref().unwrap().grid.overlay.len(), 1);
+    }
+
+    #[test]
+    fn insert_row_appends_and_worker_sees_it() {
+        let dir = tmp("insert-end");
+        let path = dir.join("t.parquet");
+        make_parquet(&path, 100);
+        let app = &mut App::with_engine(Engine::spawn().unwrap(), Vec::new());
+        app.open_path(path);
+        drain(app);
+        load_page0(app);
+
+        app.insert_row(RowAnchor::End);
+        wait_count(app, 101);
+        load_page0(app);
+        let f = app.file.as_mut().unwrap();
+        assert_eq!(f.new_rows_len(), 1);
+        assert_eq!(app.status, "row added (unsaved)");
+        // The new row sits at the end, all NULL, under its synthetic id.
+        assert_eq!(f.grid.rowid_at(100), Some(100));
+        assert!(matches!(
+            f.grid.cell(100, 0).unwrap().value,
+            CellValue::Null
+        ));
+        // The real rows are untouched.
+        assert_eq!(f.grid.cell(0, 0).unwrap().value, CellValue::Int(0));
+    }
+
+    #[test]
+    fn insert_row_after_splices_into_position() {
+        let dir = tmp("insert-after");
+        let path = dir.join("t.parquet");
+        make_parquet(&path, 100);
+        let app = &mut App::with_engine(Engine::spawn().unwrap(), Vec::new());
+        app.open_path(path);
+        drain(app);
+        load_page0(app);
+
+        let anchor = {
+            let f = app.file.as_mut().unwrap();
+            f.grid.rowid_at(2).unwrap()
+        };
+        app.insert_row(RowAnchor::After(anchor));
+        wait_count(app, 101);
+        load_page0(app);
+        let f = app.file.as_mut().unwrap();
+        assert_eq!(f.grid.cell(2, 0).unwrap().value, CellValue::Int(2));
+        assert_eq!(f.grid.rowid_at(3), Some(100), "new row sits at position 3");
+        assert!(matches!(f.grid.cell(3, 0).unwrap().value, CellValue::Null));
+        assert_eq!(f.grid.cell(4, 0).unwrap().value, CellValue::Int(3));
+    }
+
+    #[test]
+    fn undo_redo_row_insert() {
+        let dir = tmp("undo-insert");
+        let path = dir.join("t.parquet");
+        make_parquet(&path, 100);
+        let app = &mut App::with_engine(Engine::spawn().unwrap(), Vec::new());
+        app.open_path(path);
+        drain(app);
+        load_page0(app);
+
+        app.insert_row(RowAnchor::End);
+        wait_count(app, 101);
+        app.undo();
+        wait_count(app, 100);
+        assert_eq!(app.file.as_ref().unwrap().new_rows_len(), 0);
+        assert_eq!(app.status, "undo: add row");
+        app.redo();
+        wait_count(app, 101);
+        assert_eq!(app.file.as_ref().unwrap().new_rows_len(), 1);
+        assert_eq!(app.status, "redo: add row");
+    }
+
+    #[test]
+    fn edit_new_row_cell_and_undo() {
+        let dir = tmp("insert-edit");
+        let path = dir.join("t.parquet");
+        make_parquet(&path, 100);
+        let app = &mut App::with_engine(Engine::spawn().unwrap(), Vec::new());
+        app.open_path(path);
+        drain(app);
+        load_page0(app);
+
+        app.insert_row(RowAnchor::End);
+        wait_count(app, 101);
+        load_page0(app);
+        edit_cell(app, 100, 0, "555");
+        assert_eq!(
+            app.file.as_mut().unwrap().grid.cell(100, 0).unwrap().value,
+            CellValue::Int(555)
+        );
+        app.undo(); // undoes the edit, not the insert
+        assert!(matches!(
+            app.file.as_mut().unwrap().grid.cell(100, 0).unwrap().value,
+            CellValue::Null
+        ));
+        app.undo(); // undoes the insert
+        wait_count(app, 100);
+    }
+
+    #[test]
+    fn delete_new_row_removes_it_directly() {
+        // A not-yet-saved new row is not "marked deleted" — it simply
+        // disappears; undo brings it back with its values.
+        let dir = tmp("insert-delete");
+        let path = dir.join("t.parquet");
+        make_parquet(&path, 100);
+        let app = &mut App::with_engine(Engine::spawn().unwrap(), Vec::new());
+        app.open_path(path);
+        drain(app);
+        load_page0(app);
+
+        app.insert_row(RowAnchor::End);
+        wait_count(app, 101);
+        load_page0(app);
+        edit_cell(app, 100, 0, "555");
+        {
+            let f = app.file.as_mut().unwrap();
+            f.click_rownum(100, false);
+        }
+        app.delete_selected_rows();
+        wait_count(app, 100);
+        assert_eq!(app.file.as_ref().unwrap().new_rows_len(), 0);
+        app.undo();
+        wait_count(app, 101);
+        load_page0(app);
+        assert_eq!(
+            app.file.as_mut().unwrap().grid.cell(100, 0).unwrap().value,
+            CellValue::Int(555)
+        );
+    }
+
+    #[test]
+    fn save_materializes_new_rows_and_truncates_history() {
+        let dir = tmp("insert-save");
+        let path = dir.join("t.parquet");
+        make_parquet(&path, 100);
+        let app = &mut App::with_engine(Engine::spawn().unwrap(), Vec::new());
+        app.open_path(path.clone());
+        drain(app);
+        load_page0(app);
+
+        app.insert_row(RowAnchor::End);
+        wait_count(app, 101);
+        load_page0(app);
+        let anchor = {
+            let f = app.file.as_mut().unwrap();
+            f.grid.rowid_at(2).unwrap()
+        };
+        app.insert_row(RowAnchor::After(anchor));
+        wait_count(app, 102);
+        app.save();
+        wait_save(app);
+        wait_count(app, 102);
+
+        assert_eq!(app.file.as_ref().unwrap().new_rows_len(), 0);
+        assert_eq!(parquet_row_count(&path), 102);
+        // Splice order on disk: ..., id 2, NULL(new), id 3, ... and the
+        // end-anchored NULL row last.
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let ids: Vec<Option<i64>> = conn
+            .prepare(&format!(
+                "SELECT id FROM read_parquet({})",
+                crate::data::types::sql_quote(&path.to_string_lossy())
+            ))
+            .unwrap()
+            .query_map([], |r| r.get::<_, Option<i64>>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(ids[2], Some(2));
+        assert_eq!(ids[3], None);
+        assert_eq!(ids[4], Some(3));
+        assert_eq!(ids[101], None);
+        // History referenced synthetic rowids that are gone.
+        app.undo();
+        assert_eq!(app.status, "nothing to undo");
     }
 
     #[test]

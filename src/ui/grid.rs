@@ -12,8 +12,8 @@
 use egui::{Align, Color32, Key, Label, RichText, Sense, TextEdit, Ui};
 use egui_extras::{Column, TableBuilder};
 
-use crate::app::{App, ScrollRequest};
-use crate::data::engine::Job;
+use crate::app::{App, FileState, ScrollRequest};
+use crate::data::engine::{Job, RowAnchor};
 use crate::data::model::PAGE_SIZE;
 use crate::data::types::{CellValue, ColType, SortKey};
 use crate::theme;
@@ -21,6 +21,12 @@ use crate::util::fmt_count;
 
 const HEADER_HEIGHT: f32 = 26.0;
 const ROWNUM_WIDTH: f32 = 64.0;
+
+/// Deferred row-number interactions (insert row above/below).
+enum RowEvent {
+    InsertAbove(u64),
+    InsertBelow(u64),
+}
 
 /// Deferred header interactions.
 enum HeaderEvent {
@@ -58,6 +64,7 @@ pub fn draw(ui: &mut Ui, app: &mut App) {
     let sel_head = file.selection.map(|s| s.head);
 
     let mut header_events: Vec<HeaderEvent> = Vec::new();
+    let mut row_events: Vec<RowEvent> = Vec::new();
     // Visible row range, filled during the body pass for page requests.
     let mut seen: Option<(usize, usize)> = None;
 
@@ -176,7 +183,14 @@ pub fn draw(ui: &mut Ui, app: &mut App) {
                         let row_selected =
                             sel_rect.is_some_and(|(r0, r1, _, _)| pos >= r0 && pos <= r1);
                         row.col(|ui| {
-                            draw_rownum_cell(ui, file, sep_offsets, pos, row_selected);
+                            draw_rownum_cell(
+                                ui,
+                                file,
+                                &mut row_events,
+                                sep_offsets,
+                                pos,
+                                row_selected,
+                            );
                         });
                         for &col in visible_cols.iter() {
                             row.col(|ui| {
@@ -189,6 +203,8 @@ pub fn draw(ui: &mut Ui, app: &mut App) {
 
     // Track the rendered row range for Excel-style edge scrolling.
     file.visible_rows = seen.map(|(lo, hi)| (lo as u64, hi as u64));
+
+    apply_row_events(file, engine, &mut row_events);
 
     // Deferred header actions (needs &mut file, which the closures released).
     let mut sorted = false;
@@ -437,7 +453,8 @@ fn draw_header_cell(
 
 fn draw_rownum_cell(
     ui: &mut Ui,
-    file: &mut crate::app::FileState,
+    file: &mut FileState,
+    events: &mut Vec<RowEvent>,
     sep_offsets: &[f32],
     pos: u64,
     selected: bool,
@@ -477,6 +494,18 @@ fn draw_rownum_cell(
         let shift = ui.input(|i| i.modifiers.shift);
         file.click_rownum(pos, shift);
     }
+    // Right-click menu: insert an unsaved row above/below this one. The
+    // actions are deferred (the closures released FileState long since).
+    resp.context_menu(|ui| {
+        if ui.button("insert row above").clicked() {
+            events.push(RowEvent::InsertAbove(pos));
+            ui.close();
+        }
+        if ui.button("insert row below").clicked() {
+            events.push(RowEvent::InsertBelow(pos));
+            ui.close();
+        }
+    });
     // Show the row's true file rowid when the page is fetched (stable under
     // sort); fall back to the view position while loading.
     let shown = file.grid.rowid_at(pos).unwrap_or(pos);
@@ -667,6 +696,45 @@ fn draw_editor(ui: &mut Ui, file: &mut crate::app::FileState) {
         // race must not silently commit a half-open editor. A no-change
         // commit is a no-op; an invalid value keeps the editor.
         file.commit_editing();
+    }
+}
+
+/// Apply deferred row-number inserts: allocate the row on FileState, then
+/// sync the worker (new-row set, count, locate). Mirrors App::insert_row.
+fn apply_row_events(
+    file: &mut FileState,
+    engine: &crate::data::engine::Engine,
+    events: &mut [RowEvent],
+) {
+    for event in events {
+        let (pos, above) = match event {
+            RowEvent::InsertAbove(pos) => (*pos, true),
+            RowEvent::InsertBelow(pos) => (*pos, false),
+        };
+        let Some(rowid) = file.grid.rowid_at(pos) else {
+            continue; // page not loaded; nothing to anchor to
+        };
+        let anchor = if above {
+            RowAnchor::Before(rowid)
+        } else {
+            RowAnchor::After(rowid)
+        };
+        let newid = file.begin_insert_row(anchor);
+        engine.send(Job::SetNewRows {
+            rows: file.new_rows_spec(),
+        });
+        engine.send(Job::Count {
+            epoch: file.grid.cache.epoch(),
+            filter: file.grid.filter.clone(),
+        });
+        file.count_pending = true;
+        engine.send(Job::Locate {
+            epoch: file.grid.cache.epoch(),
+            rowid: newid,
+            sort: file.grid.sort.clone(),
+            filter: file.grid.filter.clone(),
+        });
+        file.pending_select = Some(newid);
     }
 }
 

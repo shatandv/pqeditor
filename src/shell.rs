@@ -139,6 +139,9 @@ impl eframe::App for App {
             match action {
                 ui::panels::PanelAction::Open => self.open_dialog(),
                 ui::panels::PanelAction::Save => self.save(),
+                ui::panels::PanelAction::AddRow => {
+                    self.insert_row(crate::data::engine::RowAnchor::End)
+                }
                 ui::panels::PanelAction::Export => self.open_export_dialog(),
                 ui::panels::PanelAction::SubmitFilter => self.submit_filter(),
                 ui::panels::PanelAction::ClearFilter => self.clear_filter(),

@@ -38,6 +38,29 @@ pub enum FailSource {
     General,
 }
 
+/// Where an unsaved new row sits in the file order. New rows exist in
+/// the overlay until save; the anchor decides their splice position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowAnchor {
+    /// Immediately after this true rowid.
+    After(u64),
+    /// Immediately before this true rowid (also covers "above row 0").
+    Before(u64),
+    /// Appended at the end of the file.
+    End,
+}
+
+/// App -> worker payload for unsaved new rows: rowid, anchor, sparse
+/// values (unlisted cells are NULL).
+pub type NewRowSpec = (u64, RowAnchor, Vec<(usize, EditValue)>);
+
+/// Worker-side new row: rowid, splice sortkey, sparse values.
+pub struct StoredNewRow {
+    pub rowid: u64,
+    pub sk: f64,
+    pub values: Vec<(usize, EditValue)>,
+}
+
 #[derive(Debug)]
 pub enum Job {
     /// `count(*)` for the proposed filter. A bad fragment answers
@@ -62,6 +85,10 @@ pub enum Job {
     Open { path: PathBuf },
     /// Replace the worker's deleted-row set (and therefore the view).
     SetDeletedRows { rows: Vec<u64> },
+    /// Replace the worker's new-row set (rows that exist only in the
+    /// overlay until saved). The view unions them in, spliced at their
+    /// anchors.
+    SetNewRows { rows: Vec<NewRowSpec> },
     /// Find a rowid's view position under the current sort/filter, for
     /// jumping to the row an undo touched when its page is not cached.
     Locate {
@@ -212,6 +239,10 @@ struct Worker {
     /// The view is recreated whenever this changes so every query
     /// (count/rows/stats/top-values/export) sees the deletion.
     deleted_rows: Vec<u64>,
+    /// Rows that exist only in the overlay until saved, with the sortkey
+    /// that splices them into view order (real rows sort by their rowid,
+    /// which equals their file position).
+    new_rows: Vec<StoredNewRow>,
 }
 
 impl Worker {
@@ -223,6 +254,7 @@ impl Worker {
             schema: Vec::new(),
             seq: 0,
             deleted_rows: Vec::new(),
+            new_rows: Vec::new(),
         })
     }
 
@@ -247,10 +279,11 @@ impl Worker {
         self.seq += 1;
         self.path = Some(path);
         self.deleted_rows.clear();
+        self.new_rows.clear();
         self.recreate_view()?;
 
         let mut stmt = self.conn.prepare(&format!(
-            "DESCRIBE SELECT * EXCLUDE (__rowid) FROM {}",
+            "DESCRIBE SELECT * EXCLUDE (__rowid, __pq_sk) FROM {}",
             self.view_name()
         ))?;
         let mapped = stmt.query_map([], |r| {
@@ -272,8 +305,11 @@ impl Worker {
         Ok((self.schema.clone(), total as u64))
     }
 
-    /// Recreate the view, excluding user-deleted rows. Cheap: it is just a
-    /// view definition over read_parquet.
+    /// Recreate the view: the file's rows (minus user-deleted ones) UNION
+    /// ALL the overlay's new rows, each carrying a `__pq_sk` sortkey that
+    /// splices new rows into view order (real rows sort by their rowid,
+    /// which equals their file position). Cheap: it is just a view
+    /// definition over read_parquet.
     fn recreate_view(&mut self) -> Result<()> {
         let p = self
             .path
@@ -281,7 +317,7 @@ impl Worker {
             .map(|p| path_string(p))
             .ok_or_else(|| anyhow!("no file open"))?;
         let mut sql = format!(
-            "CREATE OR REPLACE VIEW {} AS SELECT * FROM (SELECT row_number() OVER () - 1 AS __rowid, * FROM read_parquet({}))",
+            "CREATE OR REPLACE VIEW {} AS WITH base AS (SELECT row_number() OVER () - 1 AS __rowid, row_number() OVER () - 1 AS __pq_sk, * FROM read_parquet({}))",
             self.view_name(),
             sql_quote(&p),
         );
@@ -292,21 +328,99 @@ impl Worker {
                 .map(|r| r.to_string())
                 .collect::<Vec<_>>()
                 .join(", ");
-            sql.push_str(&format!(" WHERE __rowid NOT IN ({ids})"));
+            sql.push_str(&format!(" SELECT * FROM base WHERE __rowid NOT IN ({ids})"));
+        } else {
+            sql.push_str(" SELECT * FROM base");
+        }
+        if !self.new_rows.is_empty() {
+            // __pq_new's column order is (__rowid, __pq_sk, schema...),
+            // matching the base branch's projection exactly.
+            sql.push_str(" UNION ALL SELECT * FROM __pq_new");
         }
         self.conn.execute_batch(&sql)?;
         Ok(())
     }
 
-    /// FROM/WHERE/ORDER BY suffix shared by count/rows/export queries.
+    /// Replace the overlay's new-row set: rebuild the temp table (typed
+    /// columns, NULLs where the app sent no value) and recreate the view.
+    fn set_new_rows(&mut self, rows: Vec<NewRowSpec>) -> Result<()> {
+        // Sortkeys: rows sharing an anchor keep their relative list order
+        // via a small offset; end-anchored rows sort above every real
+        // rowid. Doubles give ~500k rows per anchor before precision
+        // blurs — realistic by a wide margin.
+        let mut sk = Vec::with_capacity(rows.len());
+        let mut order: std::collections::HashMap<(u8, u64), u32> = std::collections::HashMap::new();
+        for (_, anchor, _) in &rows {
+            let (base, key, sign) = match anchor {
+                RowAnchor::After(a) => (*a as f64, 0u8, 1.0f64),
+                RowAnchor::Before(b) => (*b as f64, 1u8, -1.0f64),
+                RowAnchor::End => (1e15f64, 2u8, 1.0f64),
+            };
+            let n = order
+                .entry((
+                    key,
+                    match anchor {
+                        RowAnchor::After(a) => *a,
+                        RowAnchor::Before(b) => *b,
+                        RowAnchor::End => 0,
+                    },
+                ))
+                .or_insert(0);
+            let idx = *n;
+            *n += 1;
+            sk.push(base + sign * (0.5 + f64::from(idx) * 1e-6));
+        }
+
+        self.new_rows = rows
+            .into_iter()
+            .zip(sk)
+            .map(|((rowid, _, values), sk)| StoredNewRow { rowid, sk, values })
+            .collect();
+
+        // Rebuild __pq_new with the exact schema shape.
+        self.conn.execute_batch("DROP TABLE IF EXISTS __pq_new")?;
+        let mut create = String::from("CREATE TEMP TABLE __pq_new(__rowid BIGINT, __pq_sk DOUBLE");
+        for col in &self.schema {
+            create.push_str(&format!(", {} {}", sql_ident(&col.name), col.ty.sql_type()));
+        }
+        create.push(')');
+        self.conn.execute_batch(&create)?;
+
+        let mut ins = String::from("INSERT INTO __pq_new VALUES (?, ?");
+        for (i, col) in self.schema.iter().enumerate() {
+            let _ = i;
+            ins.push_str(&format!(", CAST(? AS {})", col.ty.sql_type()));
+        }
+        ins.push(')');
+        let mut stmt = self.conn.prepare(&ins)?;
+        for row in &self.new_rows {
+            let mut params: Vec<duckdb::types::Value> = Vec::with_capacity(2 + self.schema.len());
+            params.push(duckdb::types::Value::BigInt(row.rowid as i64));
+            params.push(duckdb::types::Value::Double(row.sk));
+            for (i, _) in self.schema.iter().enumerate() {
+                let val = match row.values.iter().find(|(c, _)| *c == i) {
+                    Some((_, EditValue::Text(t))) => duckdb::types::Value::Text(t.clone()),
+                    _ => duckdb::types::Value::Null,
+                };
+                params.push(val);
+            }
+            stmt.execute(duckdb::params_from_iter(params))?;
+        }
+        self.recreate_view()
+    }
+
+    /// FROM/WHERE/ORDER BY suffix shared by rows/locate/export queries.
+    /// The `__pq_sk` sortkey always closes the ordering: without sort keys
+    /// it IS the view order (file order with new rows spliced at their
+    /// anchors); with sort keys it is the deterministic tiebreaker.
     fn select_suffix(&self, sort: &[SortKey], filter: Option<&str>) -> String {
         let mut sql = format!(" FROM {}", self.view_name());
         if let Some(f) = filter {
             sql.push_str(" WHERE ");
             sql.push_str(f);
         }
+        sql.push_str(" ORDER BY ");
         if !sort.is_empty() {
-            sql.push_str(" ORDER BY ");
             let keys: Vec<String> = sort
                 .iter()
                 .map(|k| {
@@ -319,6 +433,19 @@ impl Worker {
                 })
                 .collect();
             sql.push_str(&keys.join(", "));
+            sql.push_str(", ");
+        }
+        sql.push_str("__pq_sk");
+        sql
+    }
+
+    /// FROM/WHERE only, for aggregate queries (count) where an ORDER BY
+    /// over non-aggregated columns would be invalid.
+    fn select_where(&self, filter: Option<&str>) -> String {
+        let mut sql = format!(" FROM {}", self.view_name());
+        if let Some(f) = filter {
+            sql.push_str(" WHERE ");
+            sql.push_str(f);
         }
         sql
     }
@@ -331,7 +458,7 @@ impl Worker {
         // inside the window function (an outer ORDER BY applies after
         // row_number() and would leave file-order positions).
         let over = if sort.is_empty() {
-            "OVER ()".to_string()
+            "OVER (ORDER BY __pq_sk)".to_string()
         } else {
             let keys: Vec<String> = sort
                 .iter()
@@ -344,7 +471,7 @@ impl Worker {
                     format!("{col} {}", if k.ascending { "ASC" } else { "DESC" })
                 })
                 .collect();
-            format!("OVER (ORDER BY {})", keys.join(", "))
+            format!("OVER (ORDER BY {}, __pq_sk)", keys.join(", "))
         };
         let where_clause = match filter {
             Some(f) => format!(" WHERE {f}"),
@@ -364,7 +491,7 @@ impl Worker {
     }
 
     fn count(&self, filter: Option<&str>) -> Result<u64> {
-        let sql = format!("SELECT count(*){}", self.select_suffix(&[], filter));
+        let sql = format!("SELECT count(*){}", self.select_where(filter));
         let n: i64 = self.conn.query_row(&sql, [], |r| r.get(0))?;
         Ok(n as u64)
     }
@@ -543,13 +670,16 @@ impl Worker {
             }
         }
 
-        // 2. Source snapshot with stable rowids.
+        // 2. Source snapshot from the live view: file-order rowids for
+        //    real rows, splice sortkeys, deleted rows already excluded,
+        //    unsaved new rows present with their current values.
         self.conn.execute_batch(&format!(
-            "CREATE OR REPLACE TEMP TABLE __pq_src AS SELECT row_number() OVER () - 1 AS __rowid, * FROM read_parquet({})",
-            sql_quote(&path_string(&target)),
+            "CREATE OR REPLACE TEMP TABLE __pq_src AS SELECT __rowid, __pq_sk, * FROM {}",
+            self.view_name(),
         ))?;
 
-        // 3. Apply edits column-wise (one UPDATE per edited column).
+        // 3. Apply edits column-wise (one UPDATE per edited column). Edits
+        //    on unsaved new rows hit them here too: same unique rowid.
         let mut edited: Vec<usize> = overlay.iter().map(|(_, c, _)| *c).collect();
         edited.sort_unstable();
         edited.dedup();
@@ -564,20 +694,9 @@ impl Worker {
             ))?;
         }
 
-        // 3b. Delete user-deleted rows from the snapshot.
-        if !self.deleted_rows.is_empty() {
-            let ids = self
-                .deleted_rows
-                .iter()
-                .map(|r| r.to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
-            self.conn
-                .execute_batch(&format!("DELETE FROM __pq_src WHERE __rowid IN ({ids})"))?;
-        }
-
-        // 4. Write in original file order, then atomic swap. Dropped
-        //    columns are excluded from the output.
+        // 4. Write in splice order (file order with new rows at their
+        //    anchors), then atomic swap. Dropped columns are excluded
+        //    from the output.
         let drop_names: std::collections::BTreeSet<String> = drop_cols
             .iter()
             .filter_map(|c| self.schema.get(*c).map(|s| s.name.clone()))
@@ -592,7 +711,7 @@ impl Worker {
             bail!("cannot save a file with no columns left");
         }
         self.conn.execute_batch(&format!(
-            "COPY (SELECT {} FROM __pq_src ORDER BY __rowid) TO {} (FORMAT PARQUET, COMPRESSION zstd)",
+            "COPY (SELECT {} FROM __pq_src ORDER BY __pq_sk) TO {} (FORMAT PARQUET, COMPRESSION zstd)",
             cols.join(", "),
             sql_quote(&path_string(&tmp)),
         ))?;
@@ -935,6 +1054,7 @@ fn worker_loop(
             Job::Stats { .. } => "stats",
             Job::TopValues { .. } => "top_values",
             Job::SetDeletedRows { .. } => "set_deleted_rows",
+            Job::SetNewRows { .. } => "set_new_rows",
             Job::Save { .. } => "save",
             Job::Export { .. } => "export",
         };
@@ -949,6 +1069,15 @@ fn worker_loop(
             Job::SetDeletedRows { rows } => {
                 worker.deleted_rows = rows;
                 match worker.recreate_view() {
+                    Ok(()) => continue, // no answer needed; UI requeries itself
+                    Err(e) => JobResult::Failed {
+                        source: FailSource::General,
+                        message: short_error(e),
+                    },
+                }
+            }
+            Job::SetNewRows { rows } => {
+                match worker.set_new_rows(rows) {
                     Ok(()) => continue, // no answer needed; UI requeries itself
                     Err(e) => JobResult::Failed {
                         source: FailSource::General,
@@ -1400,6 +1529,152 @@ mod integration_tests {
             }
             other => panic!("expected failure, got {other:?}"),
         }
+    }
+    // === Row insert (new rows live in the worker's view until saved) ===
+    //
+    // Synthetic rowids count up from the file's row count; each new row
+    // carries an anchor (after a rowid / before a rowid / at end) and a
+    // sortkey that splices it into view order. Save materializes them at
+    // their anchors.
+
+    #[test]
+    fn new_rows_appear_spliced_in_view() {
+        let dir = tmp("newrows-view");
+        let path = dir.join("t.parquet");
+        make_parquet(&path, 100);
+        let ta = TestApp::open(&path);
+
+        // Row 100 at end, row 101 after rowid 3 with a value in col 0.
+        ta.engine.send(Job::SetNewRows {
+            rows: vec![
+                (100, RowAnchor::End, vec![]),
+                (
+                    101,
+                    RowAnchor::After(3),
+                    vec![(0, EditValue::Text("777".into()))],
+                ),
+            ],
+        });
+
+        // Count sees both.
+        ta.engine.send(Job::Count {
+            epoch: 0,
+            filter: None,
+        });
+        match recv(&ta.engine) {
+            JobResult::Count { total, .. } => assert_eq!(total, 102),
+            other => panic!("expected Count, got {other:?}"),
+        }
+
+        // Unsorted page order = file order with the anchor splice.
+        let batch = ta.rows(0, vec![], None);
+        let ids: Vec<u64> = batch.rowids.clone();
+        assert_eq!(ids[..5], [0, 1, 2, 3, 101]);
+        assert_eq!(ids[100], 99);
+        assert_eq!(ids[101], 100);
+        // Sparse value landed; the rest of the new row is NULL.
+        assert!(matches!(batch.rows[4][0], CellValue::Int(777)));
+        assert!(matches!(batch.rows[101][0], CellValue::Null));
+        // The untouched rows keep their values.
+        assert!(matches!(batch.rows[5][0], CellValue::Int(4)));
+    }
+
+    #[test]
+    fn new_rows_sort_and_filter_like_real_rows() {
+        let dir = tmp("newrows-sort");
+        let path = dir.join("t.parquet");
+        make_parquet(&path, 100);
+        let ta = TestApp::open(&path);
+        ta.engine.send(Job::SetNewRows {
+            rows: vec![(
+                100,
+                RowAnchor::End,
+                vec![(0, EditValue::Text("500".into()))],
+            )],
+        });
+        // Descending by id: the new row (id=500) comes first.
+        let batch = ta.rows(
+            0,
+            vec![SortKey {
+                col: 0,
+                ascending: false,
+            }],
+            None,
+        );
+        assert_eq!(batch.rowids[0], 100);
+        assert!(matches!(batch.rows[0][0], CellValue::Int(500)));
+        // Filter excludes it when the predicate does not match.
+        ta.engine.send(Job::Count {
+            epoch: 0,
+            filter: Some("id > 600".to_string()),
+        });
+        match recv(&ta.engine) {
+            JobResult::Count { total, .. } => assert_eq!(total, 0),
+            other => panic!("expected Count, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn save_materializes_new_rows_at_anchors() {
+        let dir = tmp("newrows-save");
+        let path = dir.join("t.parquet");
+        make_parquet(&path, 100);
+        let ta = TestApp::open(&path);
+        ta.engine.send(Job::SetNewRows {
+            rows: vec![
+                (100, RowAnchor::End, vec![]),
+                (
+                    101,
+                    RowAnchor::After(3),
+                    vec![(0, EditValue::Text("777".into()))],
+                ),
+            ],
+        });
+
+        let (tx, _rx) = mpsc::channel::<String>();
+        ta.engine.send(Job::Save {
+            overlay: vec![],
+            drop_cols: vec![],
+            progress: tx,
+        });
+        match recv(&ta.engine) {
+            JobResult::Done {
+                kind: JobKind::Save,
+                ..
+            } => {}
+            other => panic!("expected Done(Save), got {other:?}"),
+        }
+
+        // Disk now holds 12 rows in splice order: 0,1,2,3,777,4..9,NULL.
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let count: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT count(*) FROM read_parquet({})",
+                    crate::data::types::sql_quote(&path.to_string_lossy())
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 102);
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT id FROM read_parquet({})",
+                crate::data::types::sql_quote(&path.to_string_lossy())
+            ))
+            .unwrap();
+        let ids: Vec<Option<i64>> = stmt
+            .query_map([], |r| r.get::<_, Option<i64>>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(ids, {
+            let mut base: Vec<Option<i64>> = (0..100).map(Some).collect();
+            base.insert(4, Some(777)); // after rowid 3
+            base.push(None); // end-anchored row, all NULL
+            base
+        });
     }
 }
 

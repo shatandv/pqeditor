@@ -16,6 +16,7 @@ pub enum PanelAction {
     Open,
     Save,
     Export,
+    AddRow,
     SubmitFilter,
     ClearFilter,
     DropSort(usize),
@@ -89,6 +90,16 @@ pub fn toolbar(ui: &mut Ui, app: &mut App) -> Vec<PanelAction> {
                     .clicked()
                 {
                     actions.push(PanelAction::Export);
+                }
+                if ui
+                    .add_enabled(
+                        file_open,
+                        egui::Button::new(RichText::new("+ Row").color(theme::TEXT_HEADER)),
+                    )
+                    .on_hover_text("Insert an unsaved row at the end (Ctrl+Z undoes)")
+                    .clicked()
+                {
+                    actions.push(PanelAction::AddRow);
                 }
 
                 dbg("toolbar: export drawn");
@@ -282,7 +293,7 @@ pub fn status_bar(ui: &mut Ui, app: &mut App) {
                     Some(f) => (
                         f.total_rows,
                         f.grid.shown_rows,
-                        f.grid.overlay.len(),
+                        f.grid.overlay.len() + f.new_rows.len(),
                         f.count_pending,
                     ),
                     None => (0, 0, 0, false),

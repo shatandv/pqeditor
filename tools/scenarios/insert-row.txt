@@ -1,0 +1,52 @@
+# Insert rows (overlay only until save): end-append and mid-file splice,
+# with undo/redo and save materialization.
+open <PARQUET>
+wait-open
+assert-total 100
+page0
+assert-cell 0 0 0
+# End-append: count grows, the row is all NULL, real rows untouched.
+insert-row end
+wait-count 101
+assert-count 101
+assert-total 100
+page0
+assert-cell 100 0
+assert-cell 0 0 0
+# Editing the new row's cell works like any other.
+edit 100 0 555
+assert-cell 100 0 555
+# Undo pops the newest action first: the edit, then the row itself.
+undo
+assert-cell 100 0
+assert-status undo: edit cell
+undo
+wait-count 100
+assert-count 100
+assert-status undo: add row
+# Redo restores the row, then its edit.
+redo
+wait-count 101
+assert-count 101
+assert-status redo: add row
+redo
+page0
+assert-cell 100 0 555
+assert-status redo: edit cell
+# Mid-file splice after row 2: position 3 is the new row.
+insert-row after 2
+wait-count 102
+page0
+assert-cell 2 0 2
+assert-cell 3 0
+assert-cell 4 0 3
+assert-overlay 1
+# Save materializes both rows at their anchors; history is gone.
+save
+wait-save
+wait-count 102
+assert-count 102
+assert-total 102
+assert-overlay 0
+undo
+assert-status nothing to undo

@@ -337,6 +337,33 @@ pub fn run(app: &mut App, line: &str, out: &mut impl Write) -> Result<(), String
             app.undo();
             Ok(())
         }
+        ["insert-row", at @ ..] => {
+            use crate::data::engine::RowAnchor;
+            let anchor = match at {
+                ["end"] => RowAnchor::End,
+                ["after", pos] => {
+                    let pos: u64 = pos.parse().map_err(|_| "bad pos".to_string())?;
+                    let f = need_file(app)?;
+                    let rowid = f
+                        .grid
+                        .rowid_at(pos)
+                        .ok_or_else(|| format!("row {pos} not fetched"))?;
+                    RowAnchor::After(rowid)
+                }
+                ["before", pos] => {
+                    let pos: u64 = pos.parse().map_err(|_| "bad pos".to_string())?;
+                    let f = need_file(app)?;
+                    let rowid = f
+                        .grid
+                        .rowid_at(pos)
+                        .ok_or_else(|| format!("row {pos} not fetched"))?;
+                    RowAnchor::Before(rowid)
+                }
+                _ => return fail("usage: insert-row end | after <pos> | before <pos>".into()),
+            };
+            app.insert_row(anchor);
+            Ok(())
+        }
         ["redo"] => {
             app.redo();
             Ok(())

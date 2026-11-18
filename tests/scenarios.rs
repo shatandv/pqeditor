@@ -306,3 +306,8 @@ fn scenario_undo_save_rules() {
 fn scenario_undo_drop_col() {
     run_scenario("undo-drop-col.txt", 2, 100, None);
 }
+
+#[test]
+fn scenario_insert_row() {
+    run_scenario("insert-row.txt", 1, 100, None);
+}
