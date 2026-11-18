@@ -50,6 +50,10 @@ Save
   saving deletes or dropped columns ends the history for that file
   (user-accepted trade-off). Sorts/filters are not undoable; the view
   jumps to the row the last step touched.
+- R14b Insert rows (toolbar "+ Row", row-number right-click above or
+  below). New rows exist only in the overlay until saved (synthetic
+  rowids, spliced into the view at their anchors); undoable; save
+  materializes them at their anchors.
 
 Status / feedback
 - R15 Status bar: total rows, filtered "shown" count, unsaved-edit
@@ -185,6 +189,35 @@ or the action is not undoable.
   lives inside the window function; an outer one applies too late).
 - Keys: Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y in shell.rs, gated on focus-free
   and no dialog; an open cell editor keeps Ctrl+Z for text-level undo.
+
+## 6a. Row insert (new rows exist only in the overlay until saved)
+
+New rows live on BOTH sides with the worker as the display source:
+
+- FileState.new_rows: BTreeMap<synthetic rowid, NewRow{anchor, values}>;
+  synthetic rowids count up from the file's row count (never collide
+  with real rowids). next_rowid resets to the view count after a save.
+- The worker's view unions a temp table of the new rows over the file
+  (Job::SetNewRows). Each new row carries a __pq_sk sortkey: real rows
+  sort by rowid (= file position), new rows splice at anchor ± 0.5 +
+  small offsets (After/Before/End). __pq_sk closes EVERY ordering:
+  unsorted queries order by it alone (it IS view order), sorted queries
+  use it as the tiebreaker. count() uses FROM+WHERE only (an ORDER BY
+  over non-aggregated columns is invalid under aggregation).
+- save() builds __pq_src FROM THE VIEW (deleted already excluded, new
+  rows present with current values), applies edits by rowid (they hit
+  new rows too), writes ORDER BY __pq_sk. SaveOutcome::RowsChanged also
+  covers inserts: requery + count + new_rows cleared + next_rowid reset
+  + history truncated. save()'s guard counts new rows, not just overlay
+  edits.
+- Entry points: toolbar "+ Row" (End) and row-number right-click
+  (insert above/below — RowEvent deferred like HeaderEvent, since the
+  closures released FileState). After the insert the worker locates the
+  row and the view scrolls to it and selects its first cell
+  (FileState.pending_select consumed by the Located reply).
+- Deleting a not-yet-saved row removes it outright (not marked
+  deleted); a mixed selection produces one history entry restoring
+  both sides.
 
 ## 7. Interaction state machine (all pointer semantics)
 
